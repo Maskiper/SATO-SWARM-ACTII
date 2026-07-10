@@ -212,18 +212,21 @@ def run_baseline(
     _append_message(job, "Baseline Analyzer", "observation", f"Detected {src_cu.name} ({src_cu.stat().st_size} bytes). Simple kernel pattern, low risk for port. 1 kernel found.")
     if on_progress: on_progress(job)
 
-    # 2. hipify
+    # 2. hipify — tool is auto-selected inside run_hipify(): hipify-perl
+    # preferred (no CUDA SDK needed, correct default on an AMD-only box),
+    # hipify-clang only as a fallback when hipify-perl is missing AND a
+    # real CUDA install is actually present.
     _advance(job, JobPhase.PORTING, ws)
     hip_out = ws_dir / "hip_out"
-    _append_message(job, "HIP Porting Specialist", "action", "Running hipify-clang on CUDA sources.")
-    ok, log, err = run_hipify(src_cu.parent, hip_out, job.job_id)
-    job.hipify_command = "hipify-clang ..."
+    _append_message(job, "HIP Porting Specialist", "action", "Running hipify (auto-selecting hipify-perl or hipify-clang) on CUDA sources.")
+    ok, log, err, hipify_tool = run_hipify(src_cu.parent, hip_out, job.job_id)
+    job.hipify_command = f"{hipify_tool} ..."
     (ws_dir / "logs" / "hipify.log").write_text(log, encoding="utf-8")
 
     if not ok and not MOCK:
-        _append_message(job, "HIP Porting Specialist", "observation", f"hipify returned non-zero (common on first pass). stderr snippet: {err[:180]}. Will attempt minimal repair before compile.")
+        _append_message(job, "HIP Porting Specialist", "observation", f"hipify failed (tool: {hipify_tool}). stderr snippet: {err[:180]}. Will attempt minimal repair before compile.")
     else:
-        _append_message(job, "HIP Porting Specialist", "observation", "hipify completed cleanly. Scanning for common CUDA->HIP mappings (cudaMemcpy -> hipMemcpy, kernel launch, etc.).")
+        _append_message(job, "HIP Porting Specialist", "observation", f"hipify completed cleanly with {hipify_tool}. Scanning for common CUDA->HIP mappings (cudaMemcpy -> hipMemcpy, kernel launch, etc.).")
 
     hip_files = list(hip_out.glob("*.hip.cpp")) + list(hip_out.glob("*.cpp")) + list(hip_out.glob("*.cu"))
     if not hip_files:
@@ -461,7 +464,7 @@ This baseline performs a direct hipify + compile + benchmark, once, with no repa
 ## Commands Used (Reproducible)
 ```
 # hipify
-{job.hipify_command or 'hipify-clang ...'}
+{job.hipify_command or 'hipify-perl (or hipify-clang) <auto-selected> ...'}
 # hipcc
 {job.hipcc_command or 'hipcc -O3 --offload-arch=<auto-detected> ...'}
 # run

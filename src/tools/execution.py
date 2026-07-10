@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -29,8 +30,9 @@ from src.models.job import RawMetrics
 #   SATOSWARM_MOCK=1     -> MOCK mode. No subprocess calls are made. Every
 #                           function below returns simulated GPU-shaped
 #                           data instead.
-#   SATOSWARM_MOCK=0     -> REAL mode. hipify-clang / hipcc / amd-smi are
-#                           actually invoked via subprocess on PATH.
+#   SATOSWARM_MOCK=0     -> REAL mode. hipify-perl (or hipify-clang) /
+#                           hipcc / amd-smi are actually invoked via
+#                           subprocess on PATH.
 #   unset                -> REAL mode. An unset/lost env var on the real
 #                           pod must never silently produce fake "success"
 #                           data — it tries real tools and fails loudly
@@ -39,7 +41,8 @@ from src.models.job import RawMetrics
 #                           is actually wrong. Mock requires explicit opt-in.
 #
 # To run for real: leave SATOSWARM_MOCK unset (or set it to 0) on a machine
-# that has hipify-clang, hipcc, and amd-smi on PATH.
+# that has hipify-perl (preferred — no CUDA SDK needed) or hipify-clang
+# (needs a real CUDA install), plus hipcc and amd-smi, on PATH.
 # To develop locally without AMD hardware: set SATOSWARM_MOCK=1.
 # ---------------------------------------------------------------------------
 MOCK = os.environ.get("SATOSWARM_MOCK", "0") == "1"
@@ -94,36 +97,86 @@ def get_gpu_info() -> dict:
     return {"raw": out.strip() if rc == 0 else "unknown"}
 
 
-def run_hipify(source_dir: Path, out_dir: Path, job_id: str) -> tuple[bool, str, str]:
-    """Run hipify-clang on the .cu files in source_dir.
+def _cuda_sdk_present() -> bool:
+    """Best-effort check for a real CUDA SDK — hipify-clang needs one (it
+    parses source with clang against real cuda_runtime.h / libdevice); an
+    AMD-only box has neither, and hipify-clang fails there with "cannot
+    find CUDA installation" before it translates anything.
+    """
+    return (
+        shutil.which("nvcc") is not None
+        or Path("/usr/local/cuda/include/cuda_runtime.h").exists()
+    )
 
-    In MOCK mode, _run() never actually shells out, so no .hip.cpp files
-    would otherwise exist afterward — but run_hipcc() downstream needs real
-    files to discover and "compile". Writing placeholder .hip.cpp files
-    here (mock mode only) keeps the mock pipeline internally consistent
-    without run_hipcc() silently receiving an empty source list.
+
+def run_hipify(source_dir: Path, out_dir: Path, job_id: str) -> tuple[bool, str, str, str]:
+    """Translate the .cu files in source_dir to HIP.
+
+    Prefers hipify-perl: pure text/regex substitution, needs no CUDA SDK
+    at all — the correct default on an AMD-only box. hipify-clang is only
+    attempted as a fallback, and only if hipify-perl genuinely isn't on
+    PATH AND a real CUDA install is actually present (see
+    _cuda_sdk_present()) — otherwise hipify-clang would just fail the
+    same "cannot find CUDA installation" way, for no benefit.
+
+    hipify-perl's interface is fundamentally different from hipify-clang:
+    it takes ONE .cu file and prints the translated HIP source to stdout
+    (no --cuda-path, no -o <dir> batch mode) — so each source file is
+    hipified individually here, with stdout captured and written to
+    <stem>.hip.cpp in out_dir ourselves. Diagnostics/warnings from
+    hipify-perl go to stderr (stdout is a clean redirectable source
+    stream), which is what's captured in the returned log.
+
+    Returns (success, log, stderr, tool_used) — tool_used is whichever
+    binary name was actually invoked, so the caller can record it rather
+    than assume one.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
     cu_files = list(source_dir.glob("*.cu")) + list(source_dir.glob("*.cuh"))
     if not cu_files:
-        return False, "", "No .cu files found to hipify"
+        return False, "", "No .cu files found to hipify", "n/a (no sources)"
 
-    hipify_bin = "hipify-clang"
-    cmd = [hipify_bin, "--cuda-path=/usr/local/cuda", "-o", str(out_dir)]
-    cmd += [str(f) for f in cu_files]
+    use_clang = False
+    if not MOCK:
+        perl_present = shutil.which("hipify-perl") is not None
+        if not perl_present:
+            use_clang = shutil.which("hipify-clang") is not None and _cuda_sdk_present()
 
-    rc, stdout, stderr = _run(cmd, cwd=source_dir, timeout=120)
-    success = rc == 0
+    tool_used = "hipify-clang" if use_clang else "hipify-perl"
+    logs: list[str] = []
+    overall_success = True
+    last_stderr = ""
 
-    if success and MOCK:
+    for f in cu_files:
+        out_file = out_dir / f"{f.stem}.hip.cpp"
+
+        if use_clang:
+            cmd = ["hipify-clang", "--cuda-path=/usr/local/cuda", "-o", str(out_file), str(f)]
+            rc, stdout, stderr = _run(cmd, cwd=source_dir, timeout=120)
+            success = rc == 0
+            logs.append(f"$ {' '.join(cmd)}\n{stdout}\n{stderr}")
+        else:
+            cmd = ["hipify-perl", str(f)]
+            rc, stdout, stderr = _run(cmd, cwd=source_dir, timeout=30)
+            success = rc == 0
+            if success and not MOCK:
+                out_file.write_text(stdout, encoding="utf-8")
+                logs.append(f"$ {' '.join(cmd)} > {out_file.name}  ({len(stdout)} bytes written)\n{stderr}")
+            else:
+                logs.append(f"$ {' '.join(cmd)} > {out_file.name}\n{stderr}")
+
+        overall_success = overall_success and success
+        last_stderr = stderr
+
+    if overall_success and MOCK:
         for f in cu_files:
             placeholder = out_dir / f"{f.stem}.hip.cpp"
             if not placeholder.exists():
                 placeholder.write_text(f"// [MOCK] simulated hipify output for {f.name}\n", encoding="utf-8")
 
-    log = f"$ {' '.join(cmd)}\n{stdout}\n{stderr}"
-    return success, log, stderr
+    log = "\n---\n".join(logs)
+    return overall_success, log, last_stderr, tool_used
 
 
 _detected_arch: Optional[str] = None
@@ -386,8 +439,6 @@ def _mock_seed_output(seed_name: str) -> str:
             "\n=== vectorAdd Timing ===\n"
             "Kernel time: 0.652 ms\n"
             "Achieved bandwidth: 4601.23 GB/s\n"
-            "Theoretical MI300X HBM3 peak (reference): 5300 GB/s\n"
-            "Efficiency (approx): 86.8%\n"
             "vectorAdd seed completed successfully.\n"
         )
     elif seed_name == "tiledMatmul":
@@ -399,8 +450,6 @@ def _mock_seed_output(seed_name: str) -> str:
             "\n=== Tiled Matmul Timing ===\n"
             "Kernel time: 1.874 ms\n"
             "Achieved: 1.15 TFLOPS\n"
-            "Theoretical FP32 peak reference (MI300X): ~163 TFLOPS\n"
-            "Efficiency (FP32 approx): 0.7%\n"
             "tiledMatmul seed completed successfully.\n"
         )
     elif seed_name == "reduction":

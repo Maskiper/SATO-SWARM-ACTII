@@ -2,10 +2,12 @@
 // SATO SWARM Seed 2: Tiled Matmul — Compute + shared memory
 // Self-contained tiled matrix multiply (1024x1024 default).
 // Demonstrates shared memory tiling, compute intensity, launch config sensitivity.
-// Target on MI300X: high % of FP32 / FP16 peak TFLOPS depending on precision.
+// Target: high % of the actual detected GPU's FP32 TFLOPS peak — see
+// src/baseline/pipeline.py's GPU_THEORETICAL_PEAKS for the arch-aware
+// lookup; no specific GPU is assumed here.
 //
 // After successful port, the pipeline profiles with amd-smi during the hot kernel
-// and computes achieved TFLOPS + efficiency.
+// and computes achieved TFLOPS from real measurements.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -135,8 +137,11 @@ int main(int argc, char** argv) {
   printf("\n=== Tiled Matmul Timing ===\n");
   printf("Kernel time: %.3f ms\n", ms);
   printf("Achieved: %.2f TFLOPS\n", achieved_tflops);
-  printf("Theoretical FP32 peak reference (MI300X): ~163 TFLOPS\n");
-  printf("Efficiency (FP32 approx): %.1f%%\n", (achieved_tflops / 163.0) * 100.0);
+  // No theoretical-peak / efficiency-% line here on purpose: this seed
+  // doesn't know which GPU it's running on, so it can't correctly compute
+  // that without hardcoding an assumption. The pipeline computes
+  // efficiency downstream, keyed to the actual detected architecture —
+  // see src/baseline/pipeline.py's GPU_THEORETICAL_PEAKS.
 
   CHECK_CUDA(cudaFree(d_A));
   CHECK_CUDA(cudaFree(d_B));

@@ -1,11 +1,13 @@
 // seeds/vectorAdd.cu
 // SATO SWARM Seed 1: vectorAdd — Memory bandwidth hero
 // Self-contained CUDA example for CUDA → HIP autonomous porting.
-// Target: High % of MI300X 5.3 TB/s HBM3 theoretical peak.
+// Target: High % of the actual detected GPU's memory bandwidth peak —
+// see src/baseline/pipeline.py's GPU_THEORETICAL_PEAKS for the arch-aware
+// lookup; no specific GPU or bandwidth number is assumed here.
 //
 // This file + minimal host driver is the complete input for the pipeline.
-// After hipify + hipcc + run on real MI300X, the baseline captures
-// amd-smi metrics and computes achieved BW + efficiency %.
+// After hipify + hipcc + run on real hardware, the baseline captures
+// amd-smi metrics and computes achieved BW from real measurements.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -103,8 +105,11 @@ int main(int argc, char** argv) {
   printf("\n=== vectorAdd Timing ===\n");
   printf("Kernel time: %.3f ms\n", ms);
   printf("Achieved bandwidth: %.2f GB/s\n", achieved_gbs);
-  printf("Theoretical MI300X HBM3 peak (reference): 5300 GB/s\n");
-  printf("Efficiency (approx): %.1f%%\n", (achieved_gbs / 5300.0) * 100.0);
+  // No theoretical-peak / efficiency-% line here on purpose: this seed
+  // doesn't know which GPU it's running on, so it can't correctly compute
+  // that without hardcoding an assumption. The pipeline computes
+  // efficiency downstream, keyed to the actual detected architecture —
+  // see src/baseline/pipeline.py's GPU_THEORETICAL_PEAKS.
 
   // Cleanup
   CHECK_CUDA(cudaFree(d_a));

@@ -6,9 +6,10 @@ itself on real AMD GPU hardware.
 SWARM = Swarm WorkForce Autonomous ReFActoring Migration.
 
 Given a self-contained CUDA seed, the pipeline: copies it into an isolated
-workspace, runs `hipify-clang`, compiles with `hipcc` for whichever GPU
-architecture is actually detected on the machine (MI300X, RDNA3, whatever
-— never hardcoded), runs the resulting binary, captures live `amd-smi`
+workspace, translates it to HIP (`hipify-perl` preferred — no CUDA SDK
+required; `hipify-clang` only as a fallback), compiles with `hipcc` for
+whichever GPU architecture is actually detected on the machine (MI300X,
+RDNA3, whatever — never hardcoded), runs the resulting binary, captures live `amd-smi`
 telemetry, computes achieved bandwidth/TFLOPS vs. that GPU's real
 theoretical peaks (when known), and writes a migration report + a
 downloadable artifacts tarball. Every number in that report is either a
@@ -31,7 +32,7 @@ python scripts/test_baseline.py vectorAdd
 ```bash
 pip install -r requirements.txt
 
-bash scripts/preflight.sh            # verifies hipcc/hipify-clang/amd-smi/rocprofv3/rocminfo
+bash scripts/preflight.sh            # verifies hipcc/hipify(-perl or -clang)/amd-smi/rocprofv3/rocminfo
                                       # + compiles & runs a real HIP kernel end to end
 # Real mode is the default — just don't set SATOSWARM_MOCK (or set it to 0)
 python scripts/test_baseline.py vectorAdd
@@ -54,12 +55,49 @@ rather than re-reading the environment, so there's a single source of truth.
 | `SATOSWARM_MOCK` | Behavior |
 |---|---|
 | `1` | MOCK — no subprocess calls at all. Every tool function returns simulated GPU-shaped data. |
-| `0`, or **unset** | REAL — `hipify-clang`, `hipcc`, and `amd-smi` are actually invoked via subprocess. |
+| `0`, or **unset** | REAL — `hipify-perl` (preferred) or `hipify-clang`, `hipcc`, and `amd-smi` are actually invoked via subprocess. |
 
 **Real is the default.** If the variable is ever lost or misconfigured on
 the pod, the pipeline tries real tools and fails loudly and cleanly
 (a normal `FAILED` job with a real error message) rather than silently
 producing mock data that could be mistaken for a genuine hardware result.
+
+## Which hipify tool is used, and why
+
+There are two CUDA-to-HIP translators in the ROCm toolchain, and they
+have fundamentally different requirements:
+
+- **`hipify-clang`** parses source with an actual clang front end, which
+  means it needs a real CUDA SDK installed (`cuda_runtime.h`, libdevice)
+  to resolve against — even though it's only *translating* the code, not
+  compiling it for NVIDIA. On an AMD-only box (no CUDA installed at all,
+  by definition), it fails immediately with "cannot find CUDA
+  installation" and never translates anything.
+- **`hipify-perl`** is pure text/regex substitution — no parsing, no CUDA
+  SDK required. This is the tool that actually works on an AMD-only pod,
+  confirmed by hand at `/opt/rocm/bin/hipify-perl` converting `vectorAdd.cu`
+  cleanly with nothing else installed.
+
+`src/tools/execution.py`'s `run_hipify()` prefers hipify-perl
+unconditionally when it's present. hipify-clang is only attempted as a
+fallback, and only if hipify-perl is missing **and** a real CUDA SDK is
+actually detected (`nvcc` on PATH, or `/usr/local/cuda/include/cuda_runtime.h`)
+— otherwise it would just fail the same way, for no benefit.
+
+**The interfaces are also different**, not just the requirements:
+hipify-clang takes a `--cuda-path` and can batch multiple files into a
+`-o <dir>`; hipify-perl takes exactly one `.cu` file and prints the
+translated HIP source to stdout (diagnostics go to stderr, so the stdout
+stream stays clean and redirectable). `run_hipify()` hipifies each source
+file individually and writes hipify-perl's captured stdout to
+`<stem>.hip.cpp` in the job's `hip_out/` directory itself — exactly where
+`run_hipcc()` looks for sources afterward. Whichever tool actually ran is
+recorded on `job.hipify_command` and shown in the report — never assumed.
+
+`scripts/preflight.sh` checks the same way: hipify-perl first, then
+hipify-clang only if it's paired with a detected CUDA SDK (flagged as a
+likely-to-fail FAIL otherwise, since it would pass the presence check but
+still fail at actual invocation time).
 
 ## How the target GPU architecture is detected
 
@@ -116,8 +154,8 @@ correctness self-check + timing, in one `.cu` file.
 
 Every seed in `seeds/*.cu` wraps its kernel launch in CUDA events
 (`cudaEventCreate` / `cudaEventRecord` / `cudaEventSynchronize` /
-`cudaEventElapsedTime`), which `hipify-clang` translates directly into the
-HIP equivalents before compilation — this is genuine GPU-side timing,
+`cudaEventElapsedTime`), which hipify translates directly into the HIP
+equivalents before compilation — this is genuine GPU-side timing,
 measured by the device itself, not a Python-side guess. The binary prints
 this as `Kernel time: X ms`.
 
@@ -173,7 +211,7 @@ parser's accuracy.
 ```
 src/
   models/job.py        Job state, metrics, and report schema (Pydantic)
-  tools/execution.py    hipify / hipcc / amd-smi / binary-run wrappers — mock/real switch + GPU arch auto-detection live here
+  tools/execution.py    hipify (perl/clang auto-select) / hipcc / amd-smi / binary-run wrappers — mock/real switch + GPU arch auto-detection live here
   workspace/manager.py  Per-job isolated workspace (jobs/<job_id>/...)
   baseline/pipeline.py  The port -> validate -> benchmark -> report flow + GPU_THEORETICAL_PEAKS
 seeds/                  Self-contained CUDA test kernels
@@ -188,6 +226,6 @@ RUNBOOK.md               Full copy-paste pod deployment sequence + what to save 
 
 Runtime dependency: `pydantic>=2.9.0`. That's it — everything else is
 Python standard library. On the pod (whatever AMD GPU it turns out to
-have), `hipify-clang`, `hipcc`, `amd-smi`, `rocminfo`, and ideally
-`rocm_agent_enumerator` need to be on `PATH` — `scripts/preflight.sh`
-checks all of them.
+have), `hipify-perl` (preferred — see below), `hipcc`, `amd-smi`,
+`rocminfo`, and ideally `rocm_agent_enumerator` need to be on `PATH` —
+`scripts/preflight.sh` checks all of them.

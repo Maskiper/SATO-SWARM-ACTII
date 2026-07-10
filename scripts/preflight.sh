@@ -15,7 +15,8 @@
 # tool that would have caught it before you spent time on a real job run.
 #
 # Checks:
-#   1. hipcc, hipify-clang, amd-smi, rocprofv3 are on PATH (prints versions)
+#   1. hipcc, hipify (hipify-perl preferred, hipify-clang fallback), amd-smi,
+#      rocprofv3 are on PATH (prints versions)
 #   2. rocminfo runs and reports a GPU; its actual gfx architecture is
 #      auto-detected (any AMD GPU, not just gfx942)
 #   3. A trivial HIP kernel actually compiles (for the detected
@@ -86,15 +87,30 @@ else
     fail "hipcc" "not found on PATH"
 fi
 
-if command -v hipify-clang &>/dev/null; then
-    # hipify-clang's --version output format isn't consistently documented
+# hipify-perl is preferred: pure text/regex translation, needs no CUDA
+# SDK at all -- the correct default on an AMD-only box, which has no
+# cuda_runtime.h / libdevice for hipify-clang's clang-based parser to
+# find. hipify-clang is only a fallback, and only useful if a real CUDA
+# install is actually present alongside it -- flagged separately below if
+# it's present without one, since it would fail at actual invocation time
+# despite showing up on PATH.
+if command -v hipify-perl &>/dev/null; then
+    # hipify-perl's --version behavior isn't consistently documented
     # across ROCm releases -- if this prints something unexpected, that's
-    # still a PASS (the tool exists and ran); the raw text is in the log.
+    # still a PASS (the tool exists); the raw text is in the log.
+    ver=$(hipify-perl --version 2>&1 | head -n 1)
+    echo "$ver" > "$LOGDIR/hipify_perl_version.log"
+    pass "hipify-perl" "${ver:-present (preferred -- no CUDA SDK required)}"
+elif command -v hipify-clang &>/dev/null; then
     ver=$(hipify-clang --version 2>&1 | head -n 1)
     echo "$ver" > "$LOGDIR/hipify_clang_version.log"
-    pass "hipify-clang" "${ver:-present, no version string}"
+    if [ -d /usr/local/cuda/include ] || command -v nvcc &>/dev/null; then
+        pass "hipify" "hipify-clang present with a CUDA SDK (fallback path -- hipify-perl not found). ${ver:-no version string}"
+    else
+        fail "hipify" "hipify-clang found, but no CUDA SDK detected (no nvcc, no /usr/local/cuda/include) -- it will fail with 'cannot find CUDA installation' when actually invoked. Install hipify-perl instead (needs no CUDA SDK) or install a CUDA toolkit alongside hipify-clang."
+    fi
 else
-    fail "hipify-clang" "not found on PATH"
+    fail "hipify" "neither hipify-perl nor hipify-clang found on PATH"
 fi
 
 if ver=$(get_version amd-smi); then
@@ -104,7 +120,7 @@ else
 fi
 
 if command -v rocprofv3 &>/dev/null; then
-    # Same caveat as hipify-clang: rocprofv3's --version behavior wasn't
+    # Same caveat as hipify-perl/hipify-clang above: rocprofv3's --version behavior wasn't
     # verified against real hardware when this script was written -- PASS
     # is based on presence on PATH; check preflight_logs/ for what it
     # actually printed.

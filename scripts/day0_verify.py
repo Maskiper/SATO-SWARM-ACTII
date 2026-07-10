@@ -51,13 +51,16 @@ def main() -> None:
         print("   ", line)
     print()
 
-    # 2. hipify + hipcc
+    # 2. hipify (hipify-perl preferred -- needs no CUDA SDK) + hipcc
     print("2. hipify & hipcc")
-    for tool in (["hipify-clang", "--help"], ["hipcc", "--version"]):
+    for tool in (["hipify-perl", "--help"], ["hipify-clang", "--help"], ["hipcc", "--version"]):
         rc, out, err = run(tool)
         print(f"   {' '.join(tool[:1])}: rc={rc}")
         if out:
             print("   ", out.splitlines()[0][:100])
+    print("   NOTE: hipify-perl is the preferred tool (text-based, no CUDA SDK required).")
+    print("   hipify-clang needs a real CUDA install (cuda_runtime.h) to parse sources --")
+    print("   it will fail with 'cannot find CUDA installation' on an AMD-only box.")
     print()
 
     # 3. Torch + HIP (optional — only relevant if you're also using PyTorch)
@@ -84,7 +87,7 @@ if torch.cuda.is_available():
         print("   Found seed. To run full manual port + metrics capture:")
         print("     mkdir -p /tmp/day0 && cp seeds/vectorAdd.cu /tmp/day0/")
         print("     cd /tmp/day0")
-        print("     hipify-clang vectorAdd.cu -o .")
+        print("     hipify-perl vectorAdd.cu > vectorAdd.hip.cpp   # preferred: no CUDA SDK needed")
         print("     rocminfo | grep -o 'gfx[0-9a-fA-F]*' | grep -v gfx000   # find your real arch first")
         print("     hipcc -O3 --offload-arch=<arch from above, or 'native'> -o vectorAdd_hip *.hip.cpp")
         print("     amd-smi metric --json > before.json")

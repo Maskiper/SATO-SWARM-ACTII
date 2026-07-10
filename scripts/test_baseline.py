@@ -112,8 +112,9 @@ def main():
     print("\nBaseline test complete.")
     if MOCK:
         print("   This was a MOCK run. For real hardware: unset SATOSWARM_MOCK (or set it to 0)")
-        print("   on a machine with hipify-clang, hipcc, and amd-smi on PATH. The target GPU")
-        print("   architecture is auto-detected - no config needed for gfx942, gfx1100, etc.")
+        print("   on a machine with hipify-perl (preferred, no CUDA SDK needed), hipcc, and")
+        print("   amd-smi on PATH. The target GPU architecture is auto-detected - no config")
+        print("   needed for gfx942, gfx1100, etc.")
     print("=" * 72)
 
 

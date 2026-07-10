@@ -60,12 +60,13 @@ set up on the Python side.
 bash scripts/preflight.sh
 ```
 
-Read the summary at the bottom. It checks `hipcc`, `hipify-clang`,
-`amd-smi`, `rocprofv3` (presence + version), `rocminfo` (GPU visible —
-whatever architecture it actually reports, gfx942/gfx1100/whatever, not
-assumed in advance), and actually compiles + runs a trivial HIP kernel
-*for that detected architecture* to prove the whole chain works end to
-end — not just that the binaries exist on PATH.
+Read the summary at the bottom. It checks `hipcc`, `hipify` (hipify-perl
+preferred, hipify-clang fallback), `amd-smi`, `rocprofv3` (presence +
+version), `rocminfo` (GPU visible — whatever architecture it actually
+reports, gfx942/gfx1100/whatever, not assumed in advance), and actually
+compiles + runs a trivial HIP kernel *for that detected architecture* to
+prove the whole chain works end to end — not just that the binaries exist
+on PATH.
 
 - **All PASS** → continue to step 4.
 - **Any FAIL** → stop here. Check `preflight_logs/` for the specific
@@ -74,6 +75,13 @@ end — not just that the binaries exist on PATH.
   Do not proceed to a real pipeline run with a failing preflight — you'll
   just get a `FAILED` job with "command not found," which preflight
   already told you more precisely.
+- **`hipify` fails specifically with "cannot find CUDA installation"** →
+  that's hipify-clang being used without a CUDA SDK present (it needs one
+  to parse source even though it's only translating, not compiling for
+  NVIDIA). Install `hipify-perl` instead — pure text substitution, no CUDA
+  SDK required, and the tool this pipeline actually prefers. It's usually
+  already sitting at `/opt/rocm/bin/hipify-perl` alongside the rest of the
+  ROCm toolchain; check it's on `PATH`.
 - **`hip_hello_world` fails with rc=139 specifically** → that's a segfault,
   and it almost always means an architecture mismatch: the pod provisioned
   a different GPU than expected (this has actually happened — an MI300X
@@ -112,9 +120,11 @@ python scripts/test_baseline.py vectorAdd
 ```
 
 This is the one that matters. Watch for `Status: JobStatus.COMPLETED` and
-a `Kernel time: X.XXX ms (hipEvent)` line — that confirms hipify-clang and
-hipcc actually ran, the binary actually executed on the GPU, and the
-timing is a real `hipEventElapsedTime()` reading, not a placeholder.
+a `Kernel time: X.XXX ms (hipEvent)` line — that confirms hipify (perl or
+clang, whichever was auto-selected — check the report's hipify command
+line to see which) and hipcc actually ran, the binary actually executed
+on the GPU, and the timing is a real `hipEventElapsedTime()` reading, not
+a placeholder.
 
 Once vectorAdd succeeds, run the other two for a fuller picture:
 ```bash
