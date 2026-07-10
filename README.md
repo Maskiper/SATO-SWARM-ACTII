@@ -131,8 +131,17 @@ through a real pipeline run.
 bandwidth, FP32 TFLOPS) live, every run, from whatever GPU is actually
 attached — no hardcoded per-SKU table to keep updating as new cards show
 up:
-- Bandwidth: `mem_clock_mhz * bus_width_bits * 2 / 8 / 1000`, with
-  `mem_clock_mhz` (max) and `bus_width_bits` queried from `amd-smi`.
+- Bandwidth: `mem_clock_mhz * bus_width_bits * ddr_factor / 8 / 1000`, with
+  `mem_clock_mhz` (max), `bus_width_bits`, and vram type all queried from
+  `amd-smi`. `ddr_factor` is **not** a flat constant — it's looked up by
+  memory *technology* (`_MEM_TECH_DDR_FACTOR` in `src/tools/execution.py`):
+  HBM uses a textbook DDR ×2 (confirmed against MI300X's published 5300
+  GB/s); GDDR6 uses an empirically-calibrated ×17.8 (confirmed against a
+  real RX 7900 XTX/gfx1100 pod — a flat ×2, or even the naive JEDEC-
+  clock-ratio guess of ×8, both undershoot real GDDR6 bandwidth
+  substantially; see that constant's comment for the full derivation).
+  GDDR6X/GDDR5 have no confirmed factor yet and are left unhandled rather
+  than guessed.
 - FP32 TFLOPS: `compute_units * flops_per_clock_per_cu * engine_clock_mhz / 1e6`,
   with `compute_units` and `engine_clock_mhz` (max) queried from
   `rocminfo`, and `flops_per_clock_per_cu` a small per-architecture-
@@ -141,8 +150,9 @@ up:
 
 If either live query can't produce a usable value on this ROCm version
 (schema varies by release — same caveat that already applies to amd-smi
-telemetry parsing), it falls back to a small verified-spec-sheet table
-(currently just `gfx942`/MI300X), and only if that has no entry either do
+telemetry parsing — or the vram technology isn't recognized), it falls
+back to a small verified-spec-sheet table (currently `gfx942`/MI300X and
+`gfx1100`/RX 7900 XTX), and only if that has no entry either do
 `efficiency_percent` / `efficiency_tflops_percent` stay `None` — "Not
 applicable" in the report — rather than divide a real achieved number by
 another GPU's peak. Every report shows a **Theoretical peak calculation**
@@ -151,6 +161,8 @@ instead), and the full raw rocminfo/amd-smi query is saved to
 `logs/gpu_specs.log`, so the number can be checked, not just trusted.
 `achieved_bw_gbs` / `achieved_tflops` themselves are unaffected either
 way, since those come straight from the binary's own measured output.
+`scripts/verify_gpu_specs.py` dumps the raw query + computed result
+standalone, without needing a full pipeline run.
 
 ## Seeds
 

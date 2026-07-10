@@ -415,18 +415,30 @@ def capture_amd_smi_snapshot() -> tuple[RawMetrics, str]:
 # microarchitecture generation needs one new small constant, never a
 # per-card table entry.
 #
-# Formulas (both standard, publicly documented ways to derive theoretical
-# peak from raw hardware specs — see detect_gpu_theoretical_peaks()'s
-# docstring for the full reasoning):
-#   bandwidth_gbs = mem_clock_mhz * bus_width_bits * 2 / 8 / 1000
+# Formulas (see detect_gpu_theoretical_peaks()'s docstring for the full
+# reasoning):
+#   bandwidth_gbs = mem_clock_mhz * bus_width_bits * ddr_factor / 8 / 1000
 #   fp32_tflops   = compute_units * flops_per_clock_per_cu * engine_clock_mhz / 1e6
+#
+# ddr_factor is NOT a flat "2" — it's looked up per memory TECHNOLOGY (see
+# _MEM_TECH_DDR_FACTOR), because different memory technologies relate
+# their reported "clock" to true effective per-pin data rate very
+# differently. Confirmed so far:
+#   - HBM:   ddr_factor = 2.0  (textbook DDR — one transfer per clock edge)
+#   - GDDR6: ddr_factor = 17.8 (EMPIRICAL — confirmed against one real
+#            card, RX 7900 XTX/gfx1100; see _MEM_TECH_DDR_FACTOR's comment
+#            for the full derivation and why a flat x2, or the naive JEDEC
+#            x8 guess, both undershoot real GDDR6 bandwidth substantially)
+# GDDR6X/GDDR5/etc. have no confirmed factor and are deliberately left
+# unhandled (falls through to the fallback table, or "unavailable") rather
+# than guess.
 #
 # _FALLBACK_PEAKS below is NOT the primary path — it's a small safety net
 # for when the live query can't produce a number (tool missing, JSON
-# schema mismatch on this ROCm version, etc.), the same role
-# --offload-arch=native plays as a fallback for detect_gpu_arch(). Check a
-# GpuTheoreticalPeaks result's *_source fields to see which path an actual
-# run took.
+# schema mismatch on this ROCm version, unrecognized memory technology,
+# etc.), the same role --offload-arch=native plays as a fallback for
+# detect_gpu_arch(). Check a GpuTheoreticalPeaks result's *_source fields
+# to see which path an actual run took.
 # ---------------------------------------------------------------------------
 
 _ARCH_FAMILY_PATTERNS: list[tuple[re.Pattern, str]] = [
@@ -464,11 +476,23 @@ _CU_FLOPS_PER_CLOCK_BY_FAMILY: dict[str, int] = {
 }
 
 # Safety net only — see the module comment above. Not consulted unless the
-# live rocminfo/amd-smi query genuinely couldn't produce a number.
+# live rocminfo/amd-smi query genuinely couldn't produce a number. Each
+# entry's keys are independent -- a bandwidth-only or tflops-only entry is
+# valid and used for just that side.
 _FALLBACK_PEAKS: dict[str, dict[str, float]] = {
     "gfx942": {  # AMD Instinct MI300X — AMD's published spec sheet
-        "hbm_bandwidth_gbs": 5300.0,
+        "bandwidth_gbs": 5300.0,
         "fp32_tflops": 163.4,
+    },
+    "gfx1100": {  # AMD Radeon RX 7900 XTX — confirmed on a real pod
+        # (2026-07-xx, see _MEM_TECH_DDR_FACTOR's "gddr6" entry for the
+        # full derivation): amd-smi reported clock.mem_0.max_clk=1124 MHz,
+        # bus_width=384 bits, vram type=GDDR6; card's published spec sheet
+        # bandwidth is 960 GB/s. Only bandwidth is listed here -- the live
+        # rocminfo-based TFLOPS path was NOT reported broken, so no
+        # fp32_tflops fallback was added (would be guessing a number this
+        # session was never given).
+        "bandwidth_gbs": 960.0,
     },
 }
 
@@ -486,6 +510,75 @@ def _classify_arch_family(arch: Optional[str]) -> Optional[str]:
     for pattern, family in _ARCH_FAMILY_PATTERNS:
         if pattern.match(arch):
             return family
+    return None
+
+
+_MEM_TECH_DDR_FACTOR: dict[str, float] = {
+    # Replaces the DDR/effective-rate factor in the bandwidth formula
+    # DIRECTLY (bandwidth_gbs = mem_clock_mhz * bus_width_bits * FACTOR /
+    # 8 / 1000) -- this is the FULL factor, not an extra multiplier layered
+    # on top of an already-applied x2. (Easy mistake to make when
+    # reverse-engineering one of these from a real card: solving for "how
+    # much bigger does the existing x2-based answer need to be" gives a
+    # different, smaller number than solving for "what replaces the 2
+    # directly" -- see the "gddr6" derivation below, which hit exactly
+    # this trap once.)
+
+    "hbm": 2.0,
+    # HBM: textbook DDR x2 -- one transfer per clock edge (rising AND
+    # falling), a clean JEDEC-documented relationship between HBM's
+    # reported clock and its true per-pin data rate. Confirmed against
+    # MI300X's published 5300 GB/s (gfx942).
+
+    "gddr6": 17.8,
+    # GDDR6: EMPIRICAL, NOT textbook -- confirmed against exactly ONE real
+    # card so far (RX 7900 XTX / gfx1100, verified on a real pod,
+    # 2026-07-xx): amd-smi reported clock.mem_0.max_clk = 1124 (MHz),
+    # amd-smi static --vram reported bus_width = 384 (bits) and
+    # type = "GDDR6", and the card's published spec-sheet bandwidth is
+    # 960 GB/s. Solving 960 = 1124 * 384 * FACTOR / 8 / 1000 for FACTOR
+    # gives ~17.8 -- NOT the naive DDR x2 (would give ~108 GB/s), and NOT
+    # the JEDEC GDDR6 WCK:CK=4:1 x DDR-on-WCK=2 relationship either (that
+    # predicts x8, landing at ~432 GB/s -- still less than half of real).
+    # The fact that ~17.8 isn't a clean small integer suggests amd-smi's
+    # "mem_0" clock domain on RDNA2/RDNA3 is NOT the GDDR6 chips' own
+    # pin-toggling clock, but a decoupled memory-controller/Infinity-
+    # Fabric-adjacent clock domain (RDNA2 onward decoupled these when
+    # Infinity Cache was introduced) -- i.e. this constant stands in for
+    # "whatever amd-smi's mem_N.max_clk actually measures on this
+    # architecture," not a documented JEDEC ratio. TREAT AS PROVISIONAL:
+    # re-validate against a second real GDDR6 card (a different bus
+    # width/clock combination) if one becomes available, to confirm this
+    # isn't coincidental to this one SKU/driver/ROCm-version combination.
+    # Deliberately does NOT cover GDDR6X (PAM4 4-level signaling -- a
+    # fundamentally different bits-per-symbol relationship, no confirmed
+    # data point) or GDDR5/GDDR5X -- those are left unhandled (falls
+    # through to the fallback table, or "unavailable") rather than guess.
+}
+
+
+def _classify_vram_technology(vram_type_raw: Optional[str]) -> Optional[str]:
+    """Map amd-smi's raw `vram.type` string (e.g. "HBM3", "GDDR6") to a
+    normalized technology family key into _MEM_TECH_DDR_FACTOR — NOT a
+    per-SKU lookup. Every card using the same memory technology relates
+    its reported clock to true bandwidth the same way; compute_units,
+    engine_clock_mhz, mem_clock_mhz, and bus_width_bits are what actually
+    vary per-card, and all of those are queried live, never hardcoded.
+
+    Deliberately does NOT fold GDDR6X into "gddr6" — GDDR6X uses PAM4
+    (4-level) signaling, a fundamentally different bits-per-symbol
+    relationship than GDDR6's NRZ (2-level) signaling, and there is no
+    confirmed data point for it. An unrecognized/unknown type returns
+    None, which correctly leaves bandwidth_gbs unavailable (or falls to
+    the fallback table) rather than silently applying the wrong factor.
+    """
+    if not vram_type_raw:
+        return None
+    t = vram_type_raw.strip().upper()
+    if t.startswith("HBM"):
+        return "hbm"
+    if t == "GDDR6":
+        return "gddr6"
     return None
 
 
@@ -510,11 +603,14 @@ def _find_gpu_agent_block(rocminfo_text: str, want_arch: Optional[str]) -> Optio
     return gpu_chunks[0]
 
 
-def _query_amd_smi_mem_bus_specs() -> tuple[Optional[float], Optional[float], str]:
+_MEM_CLOCK_KEY_RE = re.compile(r"^(mem|mclk|memory|vram)(_\d+)?$", re.IGNORECASE)
+
+
+def _query_amd_smi_mem_bus_specs() -> tuple[Optional[float], Optional[float], Optional[str], str]:
     """Best-effort live query for (max memory clock MHz, memory bus width
-    in bits) via amd-smi, plus a human-readable log of exactly what was
-    run and what came back — so a report reader can check the raw tool
-    output against the parsed numbers themselves.
+    in bits, raw vram type string) via amd-smi, plus a human-readable log
+    of exactly what was run and what came back — so a report reader can
+    check the raw tool output against the parsed numbers themselves.
 
     Only accepts an EXPLICIT max/boost clock field for mem_clock_mhz —
     never substitutes amd-smi's current/idle clock reading, which most
@@ -523,34 +619,31 @@ def _query_amd_smi_mem_bus_specs() -> tuple[Optional[float], Optional[float], st
     higher-fidelity label (the same rule this file already applies
     everywhere else — see the module docstring at the top of this file).
 
-    amd-smi's exact JSON schema varies across ROCm releases (same caveat
-    as _parse_amd_smi_json above), and memory bus width specifically may
-    not be exposed by every version at all. This tries several plausible
-    key paths for each field and leaves it None (never a guess) if nothing
-    matches. On Day 0 with a real pod: run `amd-smi metric --clock --json`
-    and `amd-smi static --vram --json` directly, compare their actual
-    structure to the paths tried below, and add/fix key names here if a
-    value comes back None despite the tool clearly reporting it under a
-    different key.
+    Confirmed on a real ROCm install (RX 7900 XTX / gfx1100, 2026-07-xx):
+    `amd-smi metric --clock --json` reports memory clock under a
+    per-instance key like `mem_0` (not the bare `mem`/`mclk`/`memory`/
+    `vram` this originally only checked for) — real multi-die/multi-
+    channel GPUs may expose `mem_0`, `mem_1`, etc. _MEM_CLOCK_KEY_RE
+    matches any of the base names with an optional `_N` suffix; if
+    multiple instances are found, the MAXIMUM max_clk across all of them
+    is used (a defensible reading of "theoretical peak" if per-instance
+    binning ever differs — not expected to matter for typical single-
+    memory-domain consumer/datacenter cards).
 
-    IMPORTANT CAVEAT specific to GDDR6 cards (RDNA, i.e. gfx1xxx —
-    matters less for HBM/CDNA parts, where the JEDEC-clock-to-per-pin-rate
-    relationship is a clean x2): consumer GPU monitoring tools commonly
-    display GDDR6 "memory clock" using a legacy quarter-rate convention
-    inherited from GDDR5 display habits (e.g. a real 16 Gbps GDDR6 chip,
-    as shipped on the RX 6800 XT, is very widely reported by tools as
-    "2000 MHz" — a 4x-lower figure than the x2-DDR formula below expects).
-    If amd-smi follows that same convention for `mclk`/`max_clk` on a
-    given ROCm version, the x2 factor in detect_gpu_theoretical_peaks()
-    will undershoot real bandwidth by roughly 2x on GDDR6 cards
-    specifically. There is no reliable way to detect which convention is
-    in play from the JSON alone — this was NOT special-cased with a
-    guessed correction factor (that would just trade one unverified
-    assumption for a more complex one). On Day 0 with a real GDDR6-based
-    pod: compare the computed bandwidth_gbs against the card's published
-    spec-sheet number; if it's roughly half, amd-smi is using the
-    quarter-rate convention and mem_clock_mhz needs an extra x2 (or x4
-    total instead of x2) applied specifically for that field.
+    amd-smi's exact JSON schema still varies across ROCm releases beyond
+    this (same caveat as _parse_amd_smi_json above), and memory bus width
+    specifically may not be exposed by every version at all. This tries
+    several plausible key paths for bus width and vram type and leaves
+    them None (never a guess) if nothing matches. If a value comes back
+    None despite the tool clearly reporting it under a different key,
+    compare the raw JSON logged here against the paths tried below and
+    add/fix the key names.
+
+    IMPORTANT — the value found here for mem_clock_mhz does NOT directly
+    equal real per-pin data rate for every memory technology; see
+    _MEM_TECH_DDR_FACTOR in this module for the (memory-technology-
+    dependent, and for GDDR6 specifically, EMPIRICALLY-derived) factor
+    detect_gpu_theoretical_peaks() applies to convert it to bandwidth.
     """
     log_lines: list[str] = []
 
@@ -567,24 +660,31 @@ def _query_amd_smi_mem_bus_specs() -> tuple[Optional[float], Optional[float], st
         clocks = node.get("clock") if isinstance(node, dict) else None
         candidates: list[dict] = []
         if isinstance(clocks, dict):
-            for key in ("mem", "mclk", "memory", "vram"):
-                v = clocks.get(key)
-                if isinstance(v, dict):
+            for key, v in clocks.items():
+                if isinstance(v, dict) and _MEM_CLOCK_KEY_RE.match(str(key)):
                     candidates.append(v)
         elif isinstance(clocks, list):
             candidates = [
                 e for e in clocks
                 if isinstance(e, dict)
-                and str(e.get("clk_type", e.get("name", e.get("clock_type", "")))).lower()
-                in ("mem", "mclk", "memory", "vram")
+                and _MEM_CLOCK_KEY_RE.match(str(e.get("clk_type", e.get("name", e.get("clock_type", "")))))
             ]
-        for c in candidates:
-            found = _try_float(c.get("max_clk") or c.get("max") or c.get("clk_max") or c.get("max_clock"))
-            if found is not None:
-                mem_clock_mhz = found
-                break
+        found_clocks = [
+            v for v in (
+                _try_float(c.get("max_clk") or c.get("max") or c.get("clk_max") or c.get("max_clock"))
+                for c in candidates
+            )
+            if v is not None
+        ]
+        if found_clocks:
+            mem_clock_mhz = max(found_clocks)
+            if len(found_clocks) > 1:
+                log_lines.append(
+                    f"Multiple memory clock instances found ({found_clocks}) — using max: {mem_clock_mhz:g} MHz"
+                )
 
     bus_width_bits: Optional[float] = None
+    vram_type_raw: Optional[str] = None
     rc, out, err = _run(["amd-smi", "static", "--vram", "--json"], timeout=10)
     log_lines.append(f"$ amd-smi static --vram --json  (rc={rc})")
     log_lines.append((out or err or "(no output)").strip())
@@ -598,8 +698,10 @@ def _query_amd_smi_mem_bus_specs() -> tuple[Optional[float], Optional[float], st
             or _try_float(_dig(data, "vram", "bit_width"))
             or _try_float(_dig(data, "vram", "vram_bit_width"))
         )
+        raw_type = _dig(data, "vram", "type") or _dig(data, "vram", "vram_type")
+        vram_type_raw = raw_type if isinstance(raw_type, str) else None
 
-    return mem_clock_mhz, bus_width_bits, "\n".join(log_lines)
+    return mem_clock_mhz, bus_width_bits, vram_type_raw, "\n".join(log_lines)
 
 
 @dataclass
@@ -620,6 +722,9 @@ class GpuTheoreticalPeaks:
 
     mem_clock_mhz: Optional[float]
     bus_width_bits: Optional[float]
+    vram_type: Optional[str]  # raw amd-smi string, e.g. "GDDR6", "HBM3"
+    vram_tech: Optional[str]  # classified family, e.g. "gddr6", "hbm" — see _classify_vram_technology()
+    ddr_factor: Optional[float]  # from _MEM_TECH_DDR_FACTOR, keyed by vram_tech
     bandwidth_gbs: Optional[float]
     bandwidth_source: str  # "runtime" | "fallback_table" | "mock" | "unavailable"
 
@@ -636,12 +741,20 @@ class GpuTheoreticalPeaks:
         """One-line, judge-readable rendering of exactly how bandwidth_gbs
         was obtained — inserted directly into the migration report.
         """
-        if self.bandwidth_source == "runtime" and self.mem_clock_mhz and self.bus_width_bits:
-            return (
+        if self.bandwidth_source == "runtime" and self.mem_clock_mhz and self.bus_width_bits and self.ddr_factor:
+            base = (
                 f"{self.mem_clock_mhz:g} MHz (mem clock, amd-smi) x {self.bus_width_bits:g} bits "
-                f"(bus width, amd-smi) x 2 (DDR) / 8 (bits->bytes) / 1000 = {self.bandwidth_gbs:g} "
-                f"GB/s — queried live from this GPU"
+                f"(bus width, amd-smi) x {self.ddr_factor:g} (effective-rate factor for "
+                f"{self.vram_type or self.vram_tech} memory) / 8 (bits->bytes) / 1000 = "
+                f"{self.bandwidth_gbs:g} GB/s — queried live from this GPU"
             )
+            if self.vram_tech == "gddr6":
+                base += (
+                    " [GDDR6 factor is EMPIRICAL — confirmed against one real card "
+                    "(RX 7900 XTX/gfx1100) only, not a textbook constant; see "
+                    "_MEM_TECH_DDR_FACTOR in src/tools/execution.py]"
+                )
+            return base
         if self.bandwidth_source == "fallback_table":
             return (
                 f"{self.bandwidth_gbs:g} GB/s — verified spec-sheet fallback for {self.gpu_arch} "
@@ -688,11 +801,18 @@ def detect_gpu_theoretical_peaks() -> GpuTheoreticalPeaks:
     bandwidth and FP32 TFLOPS from real queried hardware specs — no
     hardcoded per-SKU table to maintain as new cards show up.
 
-    bandwidth_gbs = mem_clock_mhz * bus_width_bits * 2 / 8 / 1000
-        mem_clock_mhz + bus_width_bits come from amd-smi (see
-        _query_amd_smi_mem_bus_specs) — the *2 is DDR (one transfer per
-        clock edge, both rising and falling), /8 converts bits to bytes,
-        /1000 converts MB/s-scale to GB/s.
+    bandwidth_gbs = mem_clock_mhz * bus_width_bits * ddr_factor / 8 / 1000
+        mem_clock_mhz + bus_width_bits + vram type come from amd-smi (see
+        _query_amd_smi_mem_bus_specs). ddr_factor is looked up from
+        _MEM_TECH_DDR_FACTOR by the vram type's classified technology
+        (see _classify_vram_technology) — NOT a flat "2": HBM's reported
+        clock relates to true per-pin rate via a clean textbook DDR x2,
+        but GDDR6 does not (confirmed empirically against a real RX 7900
+        XTX/gfx1100 — see _MEM_TECH_DDR_FACTOR's "gddr6" entry for the
+        full derivation). /8 converts bits to bytes, /1000 converts
+        MB/s-scale to GB/s. If the vram type isn't recognized (no entry
+        in _MEM_TECH_DDR_FACTOR), bandwidth falls through to the fallback
+        table rather than guessing a factor.
 
     fp32_tflops = compute_units * flops_per_clock_per_cu * engine_clock_mhz / 1e6
         compute_units + engine_clock_mhz come from rocminfo (see
@@ -736,6 +856,9 @@ def detect_gpu_theoretical_peaks() -> GpuTheoreticalPeaks:
             marketing_name="AMD GPU (mock)",
             mem_clock_mhz=None,
             bus_width_bits=None,
+            vram_type=None,
+            vram_tech=None,
+            ddr_factor=None,
             bandwidth_gbs=5300.0,
             bandwidth_source="mock",
             compute_units=None,
@@ -778,31 +901,41 @@ def detect_gpu_theoretical_peaks() -> GpuTheoreticalPeaks:
     else:
         log.append((err or "rocminfo not available").strip())
 
-    mem_clock_mhz, bus_width_bits, amdsmi_log = _query_amd_smi_mem_bus_specs()
+    mem_clock_mhz, bus_width_bits, vram_type_raw, amdsmi_log = _query_amd_smi_mem_bus_specs()
     log.append(amdsmi_log)
+
+    vram_tech = _classify_vram_technology(vram_type_raw)
+    ddr_factor = _MEM_TECH_DDR_FACTOR.get(vram_tech or "")
+    log.append(
+        f"VRAM type (amd-smi): {vram_type_raw!r} -> classified technology {vram_tech!r} -> "
+        f"ddr_factor {ddr_factor!r}"
+    )
 
     fallback = _FALLBACK_PEAKS.get(arch or "", {})
 
     bandwidth_gbs: Optional[float] = None
     bandwidth_source = "unavailable"
-    if mem_clock_mhz and bus_width_bits:
-        bandwidth_gbs = round(mem_clock_mhz * bus_width_bits * 2 / 8 / 1000, 1)
+    if mem_clock_mhz and bus_width_bits and ddr_factor:
+        bandwidth_gbs = round(mem_clock_mhz * bus_width_bits * ddr_factor / 8 / 1000, 1)
         bandwidth_source = "runtime"
         log.append(
-            f"Bandwidth = {mem_clock_mhz:g} * {bus_width_bits:g} * 2 / 8 / 1000 = {bandwidth_gbs:g} GB/s"
+            f"Bandwidth = {mem_clock_mhz:g} * {bus_width_bits:g} * {ddr_factor:g} ({vram_tech}) "
+            f"/ 8 / 1000 = {bandwidth_gbs:g} GB/s"
         )
-    elif "hbm_bandwidth_gbs" in fallback:
-        bandwidth_gbs = fallback["hbm_bandwidth_gbs"]
+    elif "bandwidth_gbs" in fallback:
+        bandwidth_gbs = fallback["bandwidth_gbs"]
         bandwidth_source = "fallback_table"
         log.append(
-            f"Bandwidth: mem_clock_mhz and/or bus_width_bits not available from amd-smi on this "
-            f"ROCm version — using verified fallback spec for {arch}: {bandwidth_gbs:g} GB/s."
+            f"Bandwidth: mem_clock_mhz / bus_width_bits / recognized vram technology not all "
+            f"available from amd-smi on this ROCm version — using verified fallback spec for "
+            f"{arch}: {bandwidth_gbs:g} GB/s."
         )
     else:
         log.append(
-            f"Bandwidth: mem_clock_mhz and/or bus_width_bits not available from amd-smi, and no "
-            f"fallback entry exists for {arch or 'this (undetected) architecture'} — leaving "
-            f"theoretical_peak_gbs unset rather than guessing."
+            f"Bandwidth: mem_clock_mhz / bus_width_bits / recognized vram technology not all "
+            f"available from amd-smi, and no fallback entry exists for "
+            f"{arch or 'this (undetected) architecture'} — leaving theoretical_peak_gbs unset "
+            f"rather than guessing."
         )
 
     arch_family = _classify_arch_family(arch)
@@ -838,6 +971,9 @@ def detect_gpu_theoretical_peaks() -> GpuTheoreticalPeaks:
         marketing_name=marketing_name,
         mem_clock_mhz=mem_clock_mhz,
         bus_width_bits=bus_width_bits,
+        vram_type=vram_type_raw,
+        vram_tech=vram_tech,
+        ddr_factor=ddr_factor,
         bandwidth_gbs=bandwidth_gbs,
         bandwidth_source=bandwidth_source,
         compute_units=compute_units,
