@@ -1,0 +1,16 @@
+# Secrets — never commit
+.env
+agent_config.yaml
+
+# Python
+__pycache__/
+*.pyc
+venv*/
+.venv/
+
+# Runtime output (job workspaces, logs, generated reports)
+jobs/
+preflight_logs/
+
+# OS cruft
+.DS_Store
