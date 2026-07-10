@@ -89,6 +89,14 @@ int main(int argc, char** argv) {
   reduceSum<<<numBlocks, blockSize>>>(d_in, d_out, n);
   CHECK_CUDA(cudaDeviceSynchronize());
 
+  // d_out accumulates via atomicAdd (unlike vectorAdd/tiledMatmul, where
+  // every thread writes its own deterministic output index and a second
+  // launch is harmless) -- it MUST be reset before the timed run, or the
+  // warmup's contribution is still sitting there and gets added to again,
+  // silently doubling the result. This was a real bug: without this
+  // reset, the timed run reports 2*n instead of n.
+  CHECK_CUDA(cudaMemset(d_out, 0, sizeof(float)));
+
   cudaEvent_t start, stop;
   CHECK_CUDA(cudaEventCreate(&start));
   CHECK_CUDA(cudaEventCreate(&stop));

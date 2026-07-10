@@ -74,6 +74,59 @@ GPU_THEORETICAL_PEAKS: dict[str, dict[str, float]] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Correctness tolerances, per seed. validation_ok is only PASSED when every
+# actual-vs-expected pair the binary printed is within tolerance here — not
+# merely because the binary printed *a* result line and exited 0 (a real
+# bug: a reduction seed that returned exactly double the expected value,
+# from a stale accumulator buffer, was reported "PASSED" before this
+# existed, because "reduction result" appeared in stdout regardless of
+# what the actual number was).
+#
+# Format: (relative_tolerance, absolute_floor). A pair passes if
+# abs(actual - expected) <= max(absolute_floor, relative_tolerance *
+# abs(expected)) -- the max() handles both large-magnitude expected values
+# (relative tolerance dominates) and near-zero ones (the floor prevents an
+# unreasonably strict absolute requirement).
+#
+# Tolerances are NOT uniform across seeds on purpose:
+#   - vectorAdd: a single float32 add of two O(1) values, computed with
+#     the identical operation on host and device -- expect an exact or
+#     near-exact match. Tight.
+#   - tiledMatmul: the host sums terms in naive serial order; the device
+#     sums the same terms via tiled shared-memory blocking -- a different
+#     but equally valid summation order. Floating-point addition isn't
+#     associative, so some real, legitimate drift is expected here.
+#     Looser.
+#   - reduction: sums N copies of exactly 1.0f via a balanced tree
+#     reduction. With the default N (a power of 2) and an even per-block
+#     split, every intermediate partial sum stays exactly representable in
+#     float32 -- the correct result is exact, not merely "close". Tight,
+#     same as vectorAdd, NOT loose just because it's summing many terms.
+# ---------------------------------------------------------------------------
+VALIDATION_TOLERANCES: dict[str, tuple[float, float]] = {
+    "vectorAdd": (1e-5, 1e-4),
+    "tiledMatmul": (1e-2, 1e-2),
+    "reduction": (1e-4, 1.0),
+}
+
+
+def _validation_passes(seed_id: str, check_pairs: list[tuple[float, float]]) -> bool:
+    """True only if every actual-vs-expected pair the binary printed is
+    within this seed's tolerance (see VALIDATION_TOLERANCES). An empty
+    check_pairs list is NOT a pass -- "we couldn't confirm correctness"
+    must never default to "correct".
+    """
+    if not check_pairs:
+        return False
+    rel_tol, abs_floor = VALIDATION_TOLERANCES.get(seed_id, (1e-3, 1e-3))
+    for actual, expected in check_pairs:
+        tolerance = max(abs_floor, rel_tol * abs(expected))
+        if abs(actual - expected) > tolerance:
+            return False
+    return True
+
+
 def _now_ts() -> str:
     return datetime.utcnow().strftime("%H:%M:%S")
 
@@ -334,15 +387,17 @@ def run_baseline(
         kt_desc = f"~{derived.kernel_time_ms:.3f} ms (hipEvent, real GPU-side timing)" if derived.kernel_time_ms is not None else "Not captured (binary did not print a 'Kernel time:' line)"
         _append_message(job, "Benchmark & Profiler", "observation", f"Kernel time: {kt_desc}. Process wall-clock: {wall:.3f}s (informational only — not used as a metric). amd-smi snapshots saved to logs/amd_smi_pre.txt + amd_smi_post.txt. {len(job.messages)} decisions so far.")
 
-        # 6. Validation
+        # 6. Validation — PASSED requires BOTH that the binary ran to clean
+        # completion AND that the actual-vs-expected numbers it printed are
+        # actually within tolerance. Printing *a* result line is not
+        # correctness — a stale-buffer bug that made a reduction seed
+        # report exactly double the expected value was previously reported
+        # "PASSED" because "reduction result" appeared in stdout regardless
+        # of the number after it. This is applied the same way for all
+        # three seeds (see VALIDATION_TOLERANCES / _validation_passes),
+        # not just reduction, so this class of bug can't hide in the others.
         _advance(job, JobPhase.VALIDATING, ws)
-        validation_ok = rc == 0 and ("completed successfully" in stdout.lower() or "reduction result" in stdout.lower())
-        job.validation_passed = validation_ok
 
-        # Real max_abs_diff, computed from the actual-vs-expected pairs the
-        # seed itself printed (never a hardcoded 0.0 standing in for "it
-        # passed" — if the seed didn't print a parseable check line, this
-        # stays None / "Not captured", it does not default to 0.0).
         check_pairs = parsed.get("check_pairs")
         if check_pairs:
             job.max_abs_diff = max(abs(actual - expected) for actual, expected in check_pairs)
@@ -351,7 +406,21 @@ def run_baseline(
             job.max_abs_diff = None
             diff_desc = "Not captured (binary printed no parseable actual-vs-expected check line)"
 
-        _append_message(job, "Validator", "observation", f"Self-validation {'PASSED' if validation_ok else 'ISSUES DETECTED'} against embedded reference. Max abs diff: {diff_desc}.")
+        within_tolerance = _validation_passes(job.seed_id.value, check_pairs or [])
+        ran_to_completion = rc == 0 and ("completed successfully" in stdout.lower() or "reduction result" in stdout.lower())
+        validation_ok = ran_to_completion and within_tolerance
+        job.validation_passed = validation_ok
+
+        if not check_pairs:
+            validation_detail = f"ISSUES DETECTED — no actual-vs-expected pair could be parsed from stdout, so correctness cannot be confirmed. Max abs diff: {diff_desc}."
+        elif not within_tolerance:
+            validation_detail = f"ISSUES DETECTED — actual value(s) do not match expected within tolerance. Max abs diff: {diff_desc}."
+        elif not ran_to_completion:
+            validation_detail = f"ISSUES DETECTED — numbers matched within tolerance, but the binary did not report clean completion (rc={rc})."
+        else:
+            validation_detail = f"PASSED — actual matches expected within tolerance. Max abs diff: {diff_desc}."
+
+        _append_message(job, "Validator", "observation", f"Self-validation {validation_detail}")
     else:
         run_stdout = f"COMPILE FAILED\n{job.error or ''}\nSee logs/hipcc.log for full compiler output."
         job.validation_passed = False
