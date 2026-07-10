@@ -101,6 +101,37 @@ def _append_message(job: JobState, agent: str, typ: str, content: str) -> None:
     job.messages.append(msg)
 
 
+def _discover_hip_sources(hip_out: Path) -> list[Path]:
+    """Find the hipified source files to compile, in priority order
+    (*.hip.cpp, then *.cpp, then *.cu), with no duplicates.
+
+    A file named "vectorAdd.hip.cpp" matches BOTH "*.hip.cpp" and "*.cpp"
+    -- naively concatenating separate glob() results (three independent
+    glob() calls, unioned with `+`) put such a file on the hipcc command
+    line twice. hipcc/the linker then sees two definitions of main() and
+    every kernel in it, and fails with "duplicate symbol" errors — a real
+    failure seen on the MI300X pod, not a hypothetical.
+
+    Deduplicating by *resolved path* (not just `list(set(...))`, which
+    would also lose deterministic ordering across runs) fixes this for
+    good, for this overlap and any other pattern overlap that might be
+    introduced later — rather than trying to hand-craft each glob pattern
+    to individually exclude the others, which is fragile and only ever
+    covers the overlaps someone thought to check for.
+    """
+    seen: set[Path] = set()
+    files: list[Path] = []
+    for pattern in ("*.hip.cpp", "*.cpp", "*.cu"):
+        for p in sorted(hip_out.glob(pattern)):
+            resolved = p.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                files.append(p)
+    if not files:
+        files = sorted(hip_out.glob("*"))
+    return files
+
+
 def _advance(job: JobState, phase: JobPhase, ws: WorkspaceManager) -> None:
     if phase not in job.completed_phases:
         job.completed_phases.append(phase)
@@ -228,9 +259,7 @@ def run_baseline(
     else:
         _append_message(job, "HIP Porting Specialist", "observation", f"hipify completed cleanly with {hipify_tool}. Scanning for common CUDA->HIP mappings (cudaMemcpy -> hipMemcpy, kernel launch, etc.).")
 
-    hip_files = list(hip_out.glob("*.hip.cpp")) + list(hip_out.glob("*.cpp")) + list(hip_out.glob("*.cu"))
-    if not hip_files:
-        hip_files = list(hip_out.glob("*"))
+    hip_files = _discover_hip_sources(hip_out)
 
     # 3. hipcc — arch is auto-detected inside run_hipcc() (rocm_agent_enumerator
     # / rocminfo, falling back to --offload-arch=native), never assumed.
