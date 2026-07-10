@@ -37,7 +37,9 @@ from src.models.job import (
 )
 from src.tools.execution import (
     MOCK,
+    GpuTheoreticalPeaks,
     capture_amd_smi_snapshot,
+    detect_gpu_theoretical_peaks,
     parse_binary_output_for_metrics,
     run_binary,
     run_hipcc,
@@ -45,33 +47,11 @@ from src.tools.execution import (
 )
 from src.workspace.manager import WorkspaceManager
 
-
-# ---------------------------------------------------------------------------
-# Theoretical peak specs, keyed by detected GPU architecture (job.gpu_arch —
-# see src/tools/execution.py's detect_gpu_arch()). Efficiency percentages
-# are ONLY computed when the detected arch has a verified entry here;
-# otherwise theoretical_peak_gbs / theoretical_peak_tflops /
-# efficiency_percent / efficiency_tflops_percent all stay None and the
-# report renders "Not captured" rather than dividing a real achieved
-# number by the wrong hardware's peak (e.g. applying MI300X's ~5300 GB/s
-# to a gfx1100 card would produce a badly misleading efficiency figure —
-# this table exists specifically so that never happens silently).
-#
-# Add an entry here once you've confirmed the real spec-sheet numbers for
-# an architecture you're targeting.
-# ---------------------------------------------------------------------------
-GPU_THEORETICAL_PEAKS: dict[str, dict[str, float]] = {
-    "gfx942": {  # AMD Instinct MI300X
-        "hbm_bandwidth_gbs": 5300.0,
-        "fp32_tflops": 163.4,
-    },
-    # gfx1100 (RDNA3, Radeon 7900-class: W7900 / 7900 XTX / 7900 XT all
-    # report as gfx1100 but have different real specs) intentionally left
-    # out -- the exact SKU wasn't confirmed against the actual pod when
-    # this was written. Add it here with real numbers once confirmed
-    # (e.g. from `amd-smi` or the card's datasheet) to get efficiency_
-    # percent computed on that hardware too.
-}
+# Theoretical peak specs (memory bandwidth, FP32 TFLOPS) are computed at
+# runtime from the actual GPU present — see
+# src/tools/execution.py's detect_gpu_theoretical_peaks(). No hardcoded
+# per-SKU table lives here; see that function's docstring for the formulas
+# and its small fallback-table safety net.
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +173,9 @@ def _advance(job: JobState, phase: JobPhase, ws: WorkspaceManager) -> None:
     ws.write_state(job)
 
 
-def _compute_derived_metrics(job: JobState, parsed: dict, job_msg: Callable[[str], None]) -> DerivedMetrics:
+def _compute_derived_metrics(
+    job: JobState, parsed: dict, peaks: GpuTheoreticalPeaks, job_msg: Callable[[str], None]
+) -> DerivedMetrics:
     """Compute achieved bandwidth / TFLOPS from real measured numbers only.
 
     kernel_time_ms is the seed binary's own hipEventElapsedTime() reading
@@ -213,10 +195,12 @@ def _compute_derived_metrics(job: JobState, parsed: dict, job_msg: Callable[[str
     the independently-computed value by more than 1%.
 
     theoretical_peak_gbs / theoretical_peak_tflops / efficiency_percent /
-    efficiency_tflops_percent are only populated when job.gpu_arch has a
-    verified entry in GPU_THEORETICAL_PEAKS — otherwise they stay None
-    ("Not applicable" in the report) rather than compute a percentage
-    against the wrong hardware's spec numbers.
+    efficiency_tflops_percent come from `peaks` (see
+    src/tools/execution.py's detect_gpu_theoretical_peaks(), computed once
+    per run by the caller from the actual GPU present) and stay None
+    ("Not applicable" in the report) only when that function genuinely
+    couldn't produce a number for the detected architecture — never a
+    percentage against the wrong hardware's spec numbers.
     """
     kernel_time_ms = parsed.get("kernel_time_ms")
     derived = DerivedMetrics(kernel_time_ms=kernel_time_ms)
@@ -224,7 +208,6 @@ def _compute_derived_metrics(job: JobState, parsed: dict, job_msg: Callable[[str
         return derived
 
     seconds = kernel_time_ms / 1000.0
-    peaks = GPU_THEORETICAL_PEAKS.get(job.gpu_arch or "")
 
     def _cross_check(label: str, computed: float, self_reported: Optional[float]) -> None:
         if self_reported is None or self_reported == 0:
@@ -243,9 +226,11 @@ def _compute_derived_metrics(job: JobState, parsed: dict, job_msg: Callable[[str
         if total_gb is not None:
             derived.bytes_moved = total_gb * 1e9
             derived.achieved_bw_gbs = round(total_gb / seconds, 2)
-            if peaks and "hbm_bandwidth_gbs" in peaks:
-                derived.theoretical_peak_gbs = peaks["hbm_bandwidth_gbs"]
+            if peaks.bandwidth_gbs is not None:
+                derived.theoretical_peak_gbs = peaks.bandwidth_gbs
                 derived.efficiency_percent = round((derived.achieved_bw_gbs / derived.theoretical_peak_gbs) * 100, 1)
+                derived.theoretical_peak_source = peaks.bandwidth_source
+                derived.theoretical_peak_calculation = peaks.bandwidth_formula_str()
             _cross_check("achieved bandwidth", derived.achieved_bw_gbs, parsed.get("achieved_bw_gbs_selfreported"))
 
     elif job.seed_id.value == "tiledMatmul":
@@ -253,9 +238,11 @@ def _compute_derived_metrics(job: JobState, parsed: dict, job_msg: Callable[[str
         if gflops is not None:
             derived.flops = gflops * 1e9
             derived.achieved_tflops = round((gflops / seconds) / 1000.0, 2)
-            if peaks and "fp32_tflops" in peaks:
-                derived.theoretical_peak_tflops = peaks["fp32_tflops"]
+            if peaks.fp32_tflops is not None:
+                derived.theoretical_peak_tflops = peaks.fp32_tflops
                 derived.efficiency_tflops_percent = round((derived.achieved_tflops / derived.theoretical_peak_tflops) * 100, 1)
+                derived.theoretical_peak_source = peaks.tflops_source
+                derived.theoretical_peak_calculation = peaks.tflops_formula_str()
             _cross_check("achieved TFLOPS", derived.achieved_tflops, parsed.get("achieved_tflops_selfreported"))
 
     elif job.seed_id.value == "reduction":
@@ -378,14 +365,29 @@ def run_baseline(
             clock_mclk_mhz=post_metrics.clock_mclk_mhz,
         )
 
+        # Theoretical peak specs (bandwidth, FP32 TFLOPS) for whatever GPU
+        # is actually present -- computed once via rocminfo/amd-smi, never
+        # a hardcoded per-SKU table (see detect_gpu_theoretical_peaks()).
+        # The full raw query trace is saved to logs/gpu_specs.log so the
+        # numbers used below can be independently verified against the
+        # exact rocminfo/amd-smi output they came from.
+        gpu_peaks = detect_gpu_theoretical_peaks()
+        (ws_dir / "logs" / "gpu_specs.log").write_text(gpu_peaks.calculation_log, encoding="utf-8")
+
         derived = _compute_derived_metrics(
-            job, parsed,
+            job, parsed, gpu_peaks,
             job_msg=lambda text: _append_message(job, "Benchmark & Profiler", "observation", text),
         )
 
         job.metrics = JobMetrics(raw=raw, derived=derived)
         kt_desc = f"~{derived.kernel_time_ms:.3f} ms (hipEvent, real GPU-side timing)" if derived.kernel_time_ms is not None else "Not captured (binary did not print a 'Kernel time:' line)"
         _append_message(job, "Benchmark & Profiler", "observation", f"Kernel time: {kt_desc}. Process wall-clock: {wall:.3f}s (informational only — not used as a metric). amd-smi snapshots saved to logs/amd_smi_pre.txt + amd_smi_post.txt. {len(job.messages)} decisions so far.")
+        _append_message(
+            job, "Benchmark & Profiler", "observation",
+            f"Theoretical peak bandwidth: {gpu_peaks.bandwidth_formula_str()} "
+            f"Theoretical peak FP32 TFLOPS: {gpu_peaks.tflops_formula_str()} "
+            f"Full rocminfo/amd-smi query trace: logs/gpu_specs.log.",
+        )
 
         # 6. Validation — PASSED requires BOTH that the binary ran to clean
         # completion AND that the actual-vs-expected numbers it printed are
@@ -475,12 +477,16 @@ def generate_minimal_report(job: JobState, ws_dir: Path, run_stdout: str) -> Pat
     d = m.derived
     eff = d.efficiency_percent if d.efficiency_percent is not None else d.efficiency_tflops_percent
     achieved = d.achieved_bw_gbs if d.achieved_bw_gbs is not None else d.achieved_tflops
-    # Theoretical peak text is derived from the actual arch-keyed lookup
-    # (see GPU_THEORETICAL_PEAKS) — never a fixed MI300X number. If the
-    # detected architecture has no verified entry, this says so explicitly
-    # instead of silently reusing another GPU's spec.
+    # Theoretical peak text is derived from a live runtime hardware query
+    # (see detect_gpu_theoretical_peaks() in src/tools/execution.py) —
+    # never a fixed MI300X number. If neither the live query nor its
+    # fallback table could produce a number for the detected architecture,
+    # this says so explicitly instead of silently reusing another GPU's
+    # spec. The full calculation (see theoretical_peak_calculation below)
+    # is what actually documents the number; peak_note here is just the
+    # short inline form for the executive summary sentence.
     if job.seed_id.value == "vectorAdd":
-        peak_note = f"{d.theoretical_peak_gbs:g} GB/s HBM" if d.theoretical_peak_gbs is not None else f"unknown peak for {job.gpu_arch or 'undetected architecture'}"
+        peak_note = f"{d.theoretical_peak_gbs:g} GB/s" if d.theoretical_peak_gbs is not None else f"unknown peak for {job.gpu_arch or 'undetected architecture'}"
     else:
         peak_note = f"{d.theoretical_peak_tflops:g} TFLOPS FP32" if d.theoretical_peak_tflops is not None else f"unknown peak for {job.gpu_arch or 'undetected architecture'}"
 
@@ -541,6 +547,9 @@ def generate_minimal_report(job: JobState, ws_dir: Path, run_stdout: str) -> Pat
 | Utilization             | {_fmt(m.raw.gpu_utilization_percent, '%')} | -              | amd-smi |
 | Temperature (C)         | {_fmt(m.raw.temperature_c)}               | -                | amd-smi |
 
+**Theoretical peak calculation** (source: {d.theoretical_peak_source or "n/a"}): {d.theoretical_peak_calculation or "Not available — see logs/gpu_specs.log for the full rocminfo/amd-smi query trace."}
+*Computed live from this GPU's actual rocminfo/amd-smi output every run — no hardcoded per-SKU table. Full raw query trace: logs/gpu_specs.log.*
+
 **Key takeaway**: {"COMPILE/PORT FAILED on this run — see the Migration Notes section + logs/ for details. All attempted sources and logs are in the tar." if is_failed else ("Kernel time is the seed's own hipEventElapsedTime() measurement — real GPU-side timing recorded directly around the kernel launch. Bandwidth/TFLOPS are computed in Python from that real time plus a real byte/FLOP count also parsed from the binary's own stdout — never a constant. Power/utilization/temperature come from amd-smi; any 'Not captured' means the amd-smi JSON parser did not recognize a field on this instance — the raw amd-smi text is still saved in logs/amd_smi_pre.txt and logs/amd_smi_post.txt for manual reading." if not MOCK else "MOCK mode — every number on this page is simulated (tagged (SIMULATED) above), not measured. Run with SATOSWARM_MOCK unset (or =0) on a real AMD GPU for measured numbers — the target architecture is auto-detected, no config needed.")}
 
 ## Migration Notes & Limitations
@@ -552,11 +561,12 @@ This baseline performs a direct hipify + compile + benchmark, once, with no repa
 - amd-smi's JSON output schema varies by ROCm version — the parser in src/tools/execution.py makes a best-effort attempt at common field names and will show "Not captured" for anything it can't find, rather than guessing. The raw amd-smi text is always saved in logs/ regardless, so nothing measured is ever lost even when the parser misses a field.
 - Power/utilization are single pre/post snapshots, not continuous sampling during the kernel — "peak" power reuses the one real post-run reading rather than inventing a distinct number.
 - If the binary's own self-printed "Achieved ..." line disagrees with the Python-computed value by more than 1%, a warning message is logged (see the job's message trace) and the Python-computed value is used as the report's headline number.
+- Theoretical peak bandwidth/TFLOPS are computed live from this GPU's own rocminfo (compute units, max engine clock) + amd-smi (max memory clock, memory bus width) output — see detect_gpu_theoretical_peaks() in src/tools/execution.py. If either tool doesn't expose the fields this needs on this ROCm version, that side falls back to a small verified-spec-sheet table (currently just MI300X/gfx942), and to "Not applicable" if even that has no entry — never a guessed or borrowed-from-another-GPU number. logs/gpu_specs.log has the full raw query trace either way.
 
 ## Generated Artifacts
 - Ported HIP sources + binary: hip_out/
 - Full migration_report.md (this file)
-- logs/: hipify.log, hipcc.log, run.log, amd_smi_pre.txt, amd_smi_post.txt
+- logs/: hipify.log, hipcc.log, run.log, amd_smi_pre.txt, amd_smi_post.txt, gpu_specs.log
 - artifacts tar: {Path(job.artifacts_tar_path or '').name}
 
 ## Commands Used (Reproducible)

@@ -3,8 +3,8 @@
 // Self-contained tiled matrix multiply (1024x1024 default).
 // Demonstrates shared memory tiling, compute intensity, launch config sensitivity.
 // Target: high % of the actual detected GPU's FP32 TFLOPS peak — see
-// src/baseline/pipeline.py's GPU_THEORETICAL_PEAKS for the arch-aware
-// lookup; no specific GPU is assumed here.
+// src/tools/execution.py's detect_gpu_theoretical_peaks(), which computes
+// the real peak live from rocminfo/amd-smi; no specific GPU is assumed here.
 //
 // After successful port, the pipeline profiles with amd-smi during the hot kernel
 // and computes achieved TFLOPS from real measurements.
@@ -140,8 +140,9 @@ int main(int argc, char** argv) {
   // No theoretical-peak / efficiency-% line here on purpose: this seed
   // doesn't know which GPU it's running on, so it can't correctly compute
   // that without hardcoding an assumption. The pipeline computes
-  // efficiency downstream, keyed to the actual detected architecture —
-  // see src/baseline/pipeline.py's GPU_THEORETICAL_PEAKS.
+  // efficiency downstream, from a live rocminfo/amd-smi query of the
+  // actual GPU present — see src/tools/execution.py's
+  // detect_gpu_theoretical_peaks().
 
   CHECK_CUDA(cudaFree(d_A));
   CHECK_CUDA(cudaFree(d_B));

@@ -126,18 +126,31 @@ the same detection before compiling its hello-world check, so a
 architecture mismatch shows up there, in seconds, instead of partway
 through a real pipeline run.
 
-**Efficiency percentages follow the same rule.** `src/baseline/pipeline.py`'s
-`GPU_THEORETICAL_PEAKS` dict maps a detected architecture to its real
-spec-sheet numbers (HBM bandwidth, FP32 TFLOPS) — currently just
-`gfx942` (MI300X). If the detected architecture isn't in that table (e.g.
-`gfx1100` right now — its exact SKU wasn't confirmed against the pod when
-this was written), `efficiency_percent` / `efficiency_tflops_percent`
-stay `None` — "Not applicable" in the report — rather than divide a real
-achieved number by another GPU's peak and print a meaningless percentage.
-Add a verified entry to that dict for any architecture you want efficiency
-computed for; `achieved_bw_gbs` / `achieved_tflops` themselves are
-unaffected either way, since those come straight from the binary's own
-measured output.
+**Efficiency percentages follow the same rule.** `src/tools/execution.py`'s
+`detect_gpu_theoretical_peaks()` computes the theoretical peak (memory
+bandwidth, FP32 TFLOPS) live, every run, from whatever GPU is actually
+attached — no hardcoded per-SKU table to keep updating as new cards show
+up:
+- Bandwidth: `mem_clock_mhz * bus_width_bits * 2 / 8 / 1000`, with
+  `mem_clock_mhz` (max) and `bus_width_bits` queried from `amd-smi`.
+- FP32 TFLOPS: `compute_units * flops_per_clock_per_cu * engine_clock_mhz / 1e6`,
+  with `compute_units` and `engine_clock_mhz` (max) queried from
+  `rocminfo`, and `flops_per_clock_per_cu` a small per-architecture-
+  *family* constant (not per-SKU — every card in one microarchitecture
+  generation shares the same per-CU datapath width).
+
+If either live query can't produce a usable value on this ROCm version
+(schema varies by release — same caveat that already applies to amd-smi
+telemetry parsing), it falls back to a small verified-spec-sheet table
+(currently just `gfx942`/MI300X), and only if that has no entry either do
+`efficiency_percent` / `efficiency_tflops_percent` stay `None` — "Not
+applicable" in the report — rather than divide a real achieved number by
+another GPU's peak. Every report shows a **Theoretical peak calculation**
+line with the exact inputs and formula used (or which fallback path fired
+instead), and the full raw rocminfo/amd-smi query is saved to
+`logs/gpu_specs.log`, so the number can be checked, not just trusted.
+`achieved_bw_gbs` / `achieved_tflops` themselves are unaffected either
+way, since those come straight from the binary's own measured output.
 
 ## Seeds
 
@@ -211,9 +224,9 @@ parser's accuracy.
 ```
 src/
   models/job.py        Job state, metrics, and report schema (Pydantic)
-  tools/execution.py    hipify (perl/clang auto-select) / hipcc / amd-smi / binary-run wrappers — mock/real switch + GPU arch auto-detection live here
+  tools/execution.py    hipify (perl/clang auto-select) / hipcc / amd-smi / binary-run wrappers — mock/real switch + GPU arch AND theoretical-peak auto-detection live here
   workspace/manager.py  Per-job isolated workspace (jobs/<job_id>/...)
-  baseline/pipeline.py  The port -> validate -> benchmark -> report flow + GPU_THEORETICAL_PEAKS
+  baseline/pipeline.py  The port -> validate -> benchmark -> report flow
 seeds/                  Self-contained CUDA test kernels
 scripts/
   preflight.sh           Pod toolchain check — versions + rocminfo + a real HIP compile/run (run this first)

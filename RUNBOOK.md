@@ -147,6 +147,7 @@ the whole directory, or at minimum these files:
 | Compile logs | `jobs/<job_id>/logs/hipify.log` and `jobs/<job_id>/logs/hipcc.log` |
 | Metrics JSON | `jobs/<job_id>/state.json` (full JobState incl. `metrics.raw` + `metrics.derived` — this *is* the metrics JSON) |
 | amd-smi output | `jobs/<job_id>/logs/amd_smi_pre.txt` and `jobs/<job_id>/logs/amd_smi_post.txt` (raw text, saved regardless of whether the parser understood every field) |
+| Theoretical peak query trace | `jobs/<job_id>/logs/gpu_specs.log` (exact rocminfo/amd-smi output + the bandwidth/TFLOPS calculation performed on it — see below) |
 | Run output | `jobs/<job_id>/logs/run.log` (binary's real stdout/stderr, incl. the `Kernel time:` line) |
 | Human-readable report | `jobs/<job_id>/reports/migration_report.md` |
 | Everything bundled | `jobs/<job_id>/reports/<job_id>_artifacts.tar.gz` — all of the above in one file |
@@ -185,13 +186,33 @@ binary printed instead.
 
 ## If the efficiency percentage shows "Not applicable"
 
-Expected, not a bug, whenever `job.gpu_arch` (shown in the report's
-`**Hardware**` line and in `state.json`) isn't gfx942 — `achieved_bw_gbs`
-and `achieved_tflops` are still real, measured numbers either way; only
-the percentage-of-theoretical-peak is withheld, because
-`src/baseline/pipeline.py`'s `GPU_THEORETICAL_PEAKS` table only has a
-verified entry for MI300X (`gfx942`) so far. If the pod's real
-architecture (check `preflight_logs/rocminfo.log` or the report's
-`**Hardware**` line) has a different, known spec sheet, add an entry to
-that dict with the real numbers to get the percentage computed on future
-runs.
+`achieved_bw_gbs` and `achieved_tflops` are always real, measured numbers
+when present; only the percentage-of-theoretical-peak can be withheld.
+
+Theoretical peak (bandwidth + FP32 TFLOPS) is computed live on every real
+run by `src/tools/execution.py`'s `detect_gpu_theoretical_peaks()` —
+querying `rocminfo` (compute units, max engine clock) and `amd-smi` (max
+memory clock, memory bus width) from whatever GPU is actually attached,
+and deriving both numbers from first principles. This works the same on
+gfx942, gfx1100, or any future architecture — there's no per-SKU table to
+keep updating.
+
+The report's **Theoretical peak calculation** line (and
+`jobs/<job_id>/logs/gpu_specs.log`, which has the full raw
+rocminfo/amd-smi output the calculation was built from) shows exactly
+which path a given run took:
+- **`runtime`** — the normal case: computed live from this GPU's own
+  queried specs.
+- **`fallback_table`** — the live query didn't return a usable value
+  (e.g. `amd-smi`'s memory-bus-width field isn't recognized on this ROCm
+  version — its exact JSON schema varies by release, same caveat as
+  `_parse_amd_smi_json`) but the detected architecture has a small
+  verified fallback entry (currently just MI300X/`gfx942`). Compare
+  `logs/gpu_specs.log` against the key paths tried in
+  `_query_amd_smi_mem_bus_specs()` / the rocminfo parsing in
+  `detect_gpu_theoretical_peaks()`, and fix the key names there if the
+  live query should have worked.
+- **`unavailable`** ("Not applicable" in the report) — neither the live
+  query nor the fallback table could produce a number for this
+  architecture. `logs/gpu_specs.log` shows exactly what was tried and
+  what came back, for debugging.

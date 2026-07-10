@@ -2,8 +2,9 @@
 // SATO SWARM Seed 1: vectorAdd — Memory bandwidth hero
 // Self-contained CUDA example for CUDA → HIP autonomous porting.
 // Target: High % of the actual detected GPU's memory bandwidth peak —
-// see src/baseline/pipeline.py's GPU_THEORETICAL_PEAKS for the arch-aware
-// lookup; no specific GPU or bandwidth number is assumed here.
+// see src/tools/execution.py's detect_gpu_theoretical_peaks(), which
+// computes the real peak live from rocminfo/amd-smi; no specific GPU or
+// bandwidth number is assumed here.
 //
 // This file + minimal host driver is the complete input for the pipeline.
 // After hipify + hipcc + run on real hardware, the baseline captures
@@ -108,8 +109,9 @@ int main(int argc, char** argv) {
   // No theoretical-peak / efficiency-% line here on purpose: this seed
   // doesn't know which GPU it's running on, so it can't correctly compute
   // that without hardcoding an assumption. The pipeline computes
-  // efficiency downstream, keyed to the actual detected architecture —
-  // see src/baseline/pipeline.py's GPU_THEORETICAL_PEAKS.
+  // efficiency downstream, from a live rocminfo/amd-smi query of the
+  // actual GPU present — see src/tools/execution.py's
+  // detect_gpu_theoretical_peaks().
 
   // Cleanup
   CHECK_CUDA(cudaFree(d_a));
