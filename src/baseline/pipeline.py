@@ -46,6 +46,34 @@ from src.tools.execution import (
 from src.workspace.manager import WorkspaceManager
 
 
+# ---------------------------------------------------------------------------
+# Theoretical peak specs, keyed by detected GPU architecture (job.gpu_arch —
+# see src/tools/execution.py's detect_gpu_arch()). Efficiency percentages
+# are ONLY computed when the detected arch has a verified entry here;
+# otherwise theoretical_peak_gbs / theoretical_peak_tflops /
+# efficiency_percent / efficiency_tflops_percent all stay None and the
+# report renders "Not captured" rather than dividing a real achieved
+# number by the wrong hardware's peak (e.g. applying MI300X's ~5300 GB/s
+# to a gfx1100 card would produce a badly misleading efficiency figure —
+# this table exists specifically so that never happens silently).
+#
+# Add an entry here once you've confirmed the real spec-sheet numbers for
+# an architecture you're targeting.
+# ---------------------------------------------------------------------------
+GPU_THEORETICAL_PEAKS: dict[str, dict[str, float]] = {
+    "gfx942": {  # AMD Instinct MI300X
+        "hbm_bandwidth_gbs": 5300.0,
+        "fp32_tflops": 163.4,
+    },
+    # gfx1100 (RDNA3, Radeon 7900-class: W7900 / 7900 XTX / 7900 XT all
+    # report as gfx1100 but have different real specs) intentionally left
+    # out -- the exact SKU wasn't confirmed against the actual pod when
+    # this was written. Add it here with real numbers once confirmed
+    # (e.g. from `amd-smi` or the card's datasheet) to get efficiency_
+    # percent computed on that hardware too.
+}
+
+
 def _now_ts() -> str:
     return datetime.utcnow().strftime("%H:%M:%S")
 
@@ -99,6 +127,12 @@ def _compute_derived_metrics(job: JobState, parsed: dict, job_msg: Callable[[str
     self-printed "Achieved ..." line is parsed too, but only as a
     cross-check — job_msg() is called with a warning if it disagrees with
     the independently-computed value by more than 1%.
+
+    theoretical_peak_gbs / theoretical_peak_tflops / efficiency_percent /
+    efficiency_tflops_percent are only populated when job.gpu_arch has a
+    verified entry in GPU_THEORETICAL_PEAKS — otherwise they stay None
+    ("Not applicable" in the report) rather than compute a percentage
+    against the wrong hardware's spec numbers.
     """
     kernel_time_ms = parsed.get("kernel_time_ms")
     derived = DerivedMetrics(kernel_time_ms=kernel_time_ms)
@@ -106,6 +140,7 @@ def _compute_derived_metrics(job: JobState, parsed: dict, job_msg: Callable[[str
         return derived
 
     seconds = kernel_time_ms / 1000.0
+    peaks = GPU_THEORETICAL_PEAKS.get(job.gpu_arch or "")
 
     def _cross_check(label: str, computed: float, self_reported: Optional[float]) -> None:
         if self_reported is None or self_reported == 0:
@@ -124,7 +159,9 @@ def _compute_derived_metrics(job: JobState, parsed: dict, job_msg: Callable[[str
         if total_gb is not None:
             derived.bytes_moved = total_gb * 1e9
             derived.achieved_bw_gbs = round(total_gb / seconds, 2)
-            derived.efficiency_percent = round((derived.achieved_bw_gbs / derived.theoretical_peak_gbs) * 100, 1)
+            if peaks and "hbm_bandwidth_gbs" in peaks:
+                derived.theoretical_peak_gbs = peaks["hbm_bandwidth_gbs"]
+                derived.efficiency_percent = round((derived.achieved_bw_gbs / derived.theoretical_peak_gbs) * 100, 1)
             _cross_check("achieved bandwidth", derived.achieved_bw_gbs, parsed.get("achieved_bw_gbs_selfreported"))
 
     elif job.seed_id.value == "tiledMatmul":
@@ -132,7 +169,9 @@ def _compute_derived_metrics(job: JobState, parsed: dict, job_msg: Callable[[str
         if gflops is not None:
             derived.flops = gflops * 1e9
             derived.achieved_tflops = round((gflops / seconds) / 1000.0, 2)
-            derived.efficiency_tflops_percent = round((derived.achieved_tflops / derived.theoretical_peak_tflops) * 100, 1)
+            if peaks and "fp32_tflops" in peaks:
+                derived.theoretical_peak_tflops = peaks["fp32_tflops"]
+                derived.efficiency_tflops_percent = round((derived.achieved_tflops / derived.theoretical_peak_tflops) * 100, 1)
             _cross_check("achieved TFLOPS", derived.achieved_tflops, parsed.get("achieved_tflops_selfreported"))
 
     elif job.seed_id.value == "reduction":
@@ -163,7 +202,7 @@ def run_baseline(
     ws_dir = ws.create_workspace(job)
     job.workspace_dir = str(ws_dir)
 
-    _append_message(job, "Baseline Orchestrator", "thought", f"Starting baseline pipeline for {job.seed_id.value} on {'MOCK (local dev)' if MOCK else 'real AMD MI300X'} environment. Planning steps: analyze -> port -> validate -> benchmark -> report.")
+    _append_message(job, "Baseline Orchestrator", "thought", f"Starting baseline pipeline for {job.seed_id.value} on {'MOCK (local dev)' if MOCK else 'a real AMD GPU'} environment. Planning steps: analyze -> port -> validate -> benchmark -> report.")
     ws.write_state(job)
 
     # 1. Prepare
@@ -190,12 +229,17 @@ def run_baseline(
     if not hip_files:
         hip_files = list(hip_out.glob("*"))
 
-    # 3. hipcc
+    # 3. hipcc — arch is auto-detected inside run_hipcc() (rocm_agent_enumerator
+    # / rocminfo, falling back to --offload-arch=native), never assumed.
+    # Compiling for the wrong architecture doesn't fail the build — it
+    # produces a binary that segfaults at launch on hardware whose ISA
+    # doesn't match what was compiled for.
     binary = hip_out / f"{job.seed_id.value}_hip"
-    _append_message(job, "HIP Porting Specialist", "action", f"Compiling with hipcc -O3 --offload-arch=gfx942.")
-    ok, log, err = run_hipcc(hip_files, binary)
+    _append_message(job, "HIP Porting Specialist", "action", "Compiling with hipcc -O3 (auto-detecting target GPU architecture).")
+    ok, log, err, arch_used = run_hipcc(hip_files, binary)
     (ws_dir / "logs" / "hipcc.log").write_text(log, encoding="utf-8")
-    job.hipcc_command = f"hipcc -O3 --offload-arch=gfx942 ... -o {binary.name}"
+    job.gpu_arch = arch_used
+    job.hipcc_command = f"hipcc -O3 --offload-arch={arch_used} ... -o {binary.name}"
 
     # run_hipcc() already returns a bool (success = rc == 0 computed inside
     # it) — do NOT compare it to 0 again. `False == 0` is True in Python
@@ -208,10 +252,10 @@ def run_baseline(
     if not compile_success and not MOCK:
         job.status = JobStatus.FAILED
         job.error = f"hipcc failed: {err[:800]}"
-        _append_message(job, "HIP Porting Specialist", "observation", f"hipcc failed. Full error captured in logs/hipcc.log. Continuing to produce diagnostic report + artifacts anyway.")
+        _append_message(job, "HIP Porting Specialist", "observation", f"hipcc failed (target arch: {arch_used}). Full error captured in logs/hipcc.log. Continuing to produce diagnostic report + artifacts anyway.")
         # Do NOT early return — we still want a useful report + tar for the user
     else:
-        _append_message(job, "HIP Porting Specialist", "observation", f"hipcc succeeded cleanly on gfx942. Binary ready: {binary.name}. Moving to execution.")
+        _append_message(job, "HIP Porting Specialist", "observation", f"hipcc succeeded cleanly, compiled for detected architecture {arch_used}. Binary ready: {binary.name}. Moving to execution.")
         if on_progress: on_progress(job)
 
     # 4-5. Run + validate + metrics ONLY if compile succeeded
@@ -284,7 +328,10 @@ def run_baseline(
     if compile_success:
         final_status = JobStatus.COMPLETED
         final_phase = JobPhase.COMPLETED
-        final_thought = "Baseline pipeline finished successfully. All artifacts produced. Ready for real MI300X run (set SATOSWARM_MOCK=0 or leave unset)."
+        if MOCK:
+            final_thought = "Baseline pipeline finished successfully (MOCK). All artifacts produced. Ready for a real hardware run — set SATOSWARM_MOCK=0 or leave it unset; the target GPU architecture is auto-detected, no config needed."
+        else:
+            final_thought = f"Baseline pipeline finished successfully on real hardware (detected architecture: {job.gpu_arch}). All artifacts produced."
     else:
         final_status = JobStatus.FAILED
         final_phase = JobPhase.FAILED
@@ -327,7 +374,14 @@ def generate_minimal_report(job: JobState, ws_dir: Path, run_stdout: str) -> Pat
     d = m.derived
     eff = d.efficiency_percent if d.efficiency_percent is not None else d.efficiency_tflops_percent
     achieved = d.achieved_bw_gbs if d.achieved_bw_gbs is not None else d.achieved_tflops
-    peak_note = "5.3 TB/s HBM3" if job.seed_id.value == "vectorAdd" else "163+ TFLOPS FP32"
+    # Theoretical peak text is derived from the actual arch-keyed lookup
+    # (see GPU_THEORETICAL_PEAKS) — never a fixed MI300X number. If the
+    # detected architecture has no verified entry, this says so explicitly
+    # instead of silently reusing another GPU's spec.
+    if job.seed_id.value == "vectorAdd":
+        peak_note = f"{d.theoretical_peak_gbs:g} GB/s HBM" if d.theoretical_peak_gbs is not None else f"unknown peak for {job.gpu_arch or 'undetected architecture'}"
+    else:
+        peak_note = f"{d.theoretical_peak_tflops:g} TFLOPS FP32" if d.theoretical_peak_tflops is not None else f"unknown peak for {job.gpu_arch or 'undetected architecture'}"
 
     duration = "N/A"
     if job.updated_at and job.created_at:
@@ -360,8 +414,8 @@ def generate_minimal_report(job: JobState, ws_dir: Path, run_stdout: str) -> Pat
 
 **Job ID**: {job.job_id}
 **Date**: {job.created_at.isoformat()}
-**Hardware**: AMD Instinct MI300X (gfx942) via ROCm (see amd-smi)
-**Mode**: {"MOCK (local dev — every number below is simulated, tagged (SIMULATED), never measured)" if MOCK else "REAL MI300X"}
+**Hardware**: {f"AMD GPU, architecture {job.gpu_arch}" if job.gpu_arch else "AMD GPU (architecture not detected)"} via ROCm (see amd-smi)
+**Mode**: {"MOCK (local dev — every number below is simulated, tagged (SIMULATED), never measured)" if MOCK else "REAL hardware"}
 **Total Duration**: {duration}
 **Messages / Decisions**: {len(job.messages)}
 **Final Status**: {"FAILED" if is_failed else "COMPLETED"}
@@ -386,7 +440,7 @@ def generate_minimal_report(job: JobState, ws_dir: Path, run_stdout: str) -> Pat
 | Utilization             | {_fmt(m.raw.gpu_utilization_percent, '%')} | -              | amd-smi |
 | Temperature (C)         | {_fmt(m.raw.temperature_c)}               | -                | amd-smi |
 
-**Key takeaway**: {"COMPILE/PORT FAILED on this run — see the Migration Notes section + logs/ for details. All attempted sources and logs are in the tar." if is_failed else ("Kernel time is the seed's own hipEventElapsedTime() measurement — real GPU-side timing recorded directly around the kernel launch. Bandwidth/TFLOPS are computed in Python from that real time plus a real byte/FLOP count also parsed from the binary's own stdout — never a constant. Power/utilization/temperature come from amd-smi; any 'Not captured' means the amd-smi JSON parser did not recognize a field on this instance — the raw amd-smi text is still saved in logs/amd_smi_pre.txt and logs/amd_smi_post.txt for manual reading." if not MOCK else "MOCK mode — every number on this page is simulated (tagged (SIMULATED) above), not measured. Run with SATOSWARM_MOCK unset (or =0) on real MI300X hardware for measured numbers.")}
+**Key takeaway**: {"COMPILE/PORT FAILED on this run — see the Migration Notes section + logs/ for details. All attempted sources and logs are in the tar." if is_failed else ("Kernel time is the seed's own hipEventElapsedTime() measurement — real GPU-side timing recorded directly around the kernel launch. Bandwidth/TFLOPS are computed in Python from that real time plus a real byte/FLOP count also parsed from the binary's own stdout — never a constant. Power/utilization/temperature come from amd-smi; any 'Not captured' means the amd-smi JSON parser did not recognize a field on this instance — the raw amd-smi text is still saved in logs/amd_smi_pre.txt and logs/amd_smi_post.txt for manual reading." if not MOCK else "MOCK mode — every number on this page is simulated (tagged (SIMULATED) above), not measured. Run with SATOSWARM_MOCK unset (or =0) on a real AMD GPU for measured numbers — the target architecture is auto-detected, no config needed.")}
 
 ## Migration Notes & Limitations
 This baseline performs a direct hipify + compile + benchmark, once, with no repair loop. On real hardware:
@@ -409,14 +463,14 @@ This baseline performs a direct hipify + compile + benchmark, once, with no repa
 # hipify
 {job.hipify_command or 'hipify-clang ...'}
 # hipcc
-{job.hipcc_command or 'hipcc -O3 --offload-arch=gfx942 ...'}
+{job.hipcc_command or 'hipcc -O3 --offload-arch=<auto-detected> ...'}
 # run
 ./{job.seed_id.value}_hip
 # amd-smi
 amd-smi metric --json
 ```
 
-*This report was generated by SATO SWARM's baseline pipeline running {"on real AMD Instinct MI300X" if not MOCK else "in MOCK mode"}.*
+*This report was generated by SATO SWARM's baseline pipeline running {f"on real AMD hardware (architecture: {job.gpu_arch})" if not MOCK else "in MOCK mode"}.*
 """
     path.write_text(content, encoding="utf-8")
     return path

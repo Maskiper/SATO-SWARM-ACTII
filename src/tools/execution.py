@@ -27,11 +27,11 @@ from src.models.job import RawMetrics
 # THE MOCK/REAL SWITCH
 #
 #   SATOSWARM_MOCK=1     -> MOCK mode. No subprocess calls are made. Every
-#                           function below returns simulated MI300X-shaped
+#                           function below returns simulated GPU-shaped
 #                           data instead.
 #   SATOSWARM_MOCK=0     -> REAL mode. hipify-clang / hipcc / amd-smi are
 #                           actually invoked via subprocess on PATH.
-#   unset                -> REAL mode. An unset/lost env var on the MI300X
+#   unset                -> REAL mode. An unset/lost env var on the real
 #                           pod must never silently produce fake "success"
 #                           data — it tries real tools and fails loudly
 #                           (a clean, logged failure, not a crash — see
@@ -83,7 +83,7 @@ def is_rocm_available() -> bool:
 def get_gpu_info() -> dict:
     """Best-effort GPU name + ROCm version from amd-smi or hipcc."""
     if MOCK:
-        return {"name": "AMD Instinct MI300X (mock)", "rocm": "6.x-mock", "arch": "gfx942"}
+        return {"name": "AMD GPU (mock)", "rocm": "6.x-mock", "arch": "gfx942"}
 
     rc, out, _ = _run(["amd-smi", "--version"])
     if rc == 0:
@@ -126,10 +126,88 @@ def run_hipify(source_dir: Path, out_dir: Path, job_id: str) -> tuple[bool, str,
     return success, log, stderr
 
 
-def run_hipcc(hip_sources: list[Path], out_binary: Path, arch: str = "gfx942") -> tuple[bool, str, str]:
-    """Compile with hipcc targeting the MI300X arch."""
+_detected_arch: Optional[str] = None
+_arch_detection_attempted = False
+
+
+def detect_gpu_arch() -> Optional[str]:
+    """Auto-detect the real GPU's ROCm architecture target (e.g.
+    "gfx1100", "gfx942") — never assume one.
+
+    Tries, in order:
+      1. rocm_agent_enumerator — purpose-built for exactly this, prints
+         one gfx code per agent (gfx000 is the host/CPU placeholder and
+         is skipped).
+      2. rocminfo — falls back to scanning its full output for any
+         "gfxNNNN"-shaped token (again skipping gfx000).
+
+    Returns None if neither tool is present or neither found a usable gfx
+    target — callers should then fall back to --offload-arch=native
+    (supported by sufficiently recent ROCm compilers) rather than
+    silently compiling for a specific architecture that may not match the
+    actual hardware. A mismatch here is not a compile-time error — it
+    produces a binary that segfaults at launch (wrong ISA for the GPU
+    actually present), which is exactly what motivated this function.
+
+    Result is cached after the first call (the GPU doesn't change
+    mid-process). In MOCK mode, no subprocess is attempted at all — returns
+    "gfx942" unconditionally (matching the calibration of _mock_seed_output's
+    canned achieved-bandwidth numbers below, so mock mode's efficiency-%
+    computation is still demoable and its code path still gets exercised
+    by routine mock testing). This is purely cosmetic: it never touches
+    real compilation, and every report/message already carries an
+    unmistakable separate "Mode: MOCK"/"(SIMULATED)" label anywhere this
+    value is shown — see _fmt() and generate_minimal_report().
+    """
+    global _detected_arch, _arch_detection_attempted
+    if _arch_detection_attempted:
+        return _detected_arch
+    _arch_detection_attempted = True
+
+    if MOCK:
+        _detected_arch = "gfx942"
+        return _detected_arch
+
+    rc, out, _ = _run(["rocm_agent_enumerator"], timeout=15)
+    if rc == 0:
+        for line in out.splitlines():
+            line = line.strip()
+            if re.fullmatch(r"gfx[0-9a-fA-F]+", line) and line != "gfx000":
+                _detected_arch = line
+                return _detected_arch
+
+    rc, out, _ = _run(["rocminfo"], timeout=15)
+    if rc == 0:
+        for m in re.finditer(r"\bgfx[0-9a-fA-F]+\b", out):
+            if m.group(0) != "gfx000":
+                _detected_arch = m.group(0)
+                return _detected_arch
+
+    _detected_arch = None
+    return None
+
+
+def run_hipcc(hip_sources: list[Path], out_binary: Path, arch: Optional[str] = None) -> tuple[bool, str, str, str]:
+    """Compile with hipcc, targeting the GPU actually present.
+
+    If `arch` isn't given explicitly, auto-detects it via
+    detect_gpu_arch(). If detection itself finds nothing, falls back to
+    --offload-arch=native (ROCm 5.7+/6.x compilers auto-detect the build
+    machine's GPU at compile time) rather than assuming any specific
+    architecture — compiling for the wrong one doesn't fail the build, it
+    produces a binary that segfaults on launch.
+
+    Returns (success, log, stderr, arch_used) — arch_used is whatever was
+    actually passed to --offload-arch=, so the caller can log it and
+    record it on the job (never silently lost).
+    """
     if not hip_sources:
-        return False, "", "No HIP sources to compile"
+        return False, "", "No HIP sources to compile", "n/a (compilation never attempted)"
+
+    if arch is None:
+        arch = detect_gpu_arch()
+        if arch is None:
+            arch = "native"
 
     cmd = ["hipcc", "-O3", f"--offload-arch={arch}"]
     cmd += [str(p) for p in hip_sources]
@@ -138,7 +216,7 @@ def run_hipcc(hip_sources: list[Path], out_binary: Path, arch: str = "gfx942") -
     rc, stdout, stderr = _run(cmd, timeout=180)
     success = rc == 0
     log = f"$ {' '.join(cmd)}\n{stdout}\n{stderr}"
-    return success, log, stderr
+    return success, log, stderr, arch
 
 
 def _try_float(value: Any) -> Optional[float]:

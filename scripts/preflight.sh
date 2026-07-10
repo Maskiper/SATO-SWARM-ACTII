@@ -1,17 +1,28 @@
 #!/usr/bin/env bash
-# SATO SWARM — MI300X Pod Preflight Check
+# SATO SWARM — Pod Preflight Check
 #
 # Run this FIRST, before scripts/test_baseline.py, on the real pod. It does
 # not touch the pipeline at all — it only answers one question: "does this
 # environment actually have a working ROCm/HIP toolchain?"
 #
+# Architecture-agnostic: this script does NOT assume MI300X (gfx942). It
+# auto-detects whatever GPU architecture is actually present (gfx942,
+# gfx1100, whatever) via rocm_agent_enumerator / rocminfo, and uses that
+# for both the visibility check and the hello-world compile below.
+# Compiling for the wrong architecture doesn't fail the build — it produces
+# a binary that SEGFAULTS AT LAUNCH on hardware whose ISA doesn't match
+# what was compiled for. If you've hit that, this script is exactly the
+# tool that would have caught it before you spent time on a real job run.
+#
 # Checks:
 #   1. hipcc, hipify-clang, amd-smi, rocprofv3 are on PATH (prints versions)
-#   2. rocminfo runs and reports a GPU (looks for gfx942 = MI300X)
-#   3. A trivial HIP kernel actually compiles AND runs AND prints real
-#      device-side output — the only check here that proves the whole
-#      chain (compiler -> GPU -> back to host) actually works end to end,
-#      as opposed to just "the binary exists on PATH".
+#   2. rocminfo runs and reports a GPU; its actual gfx architecture is
+#      auto-detected (any AMD GPU, not just gfx942)
+#   3. A trivial HIP kernel actually compiles (for the detected
+#      architecture) AND runs AND prints real device-side output — the
+#      only check here that proves the whole chain (compiler -> GPU ->
+#      back to host) actually works end to end, as opposed to just "the
+#      binary exists on PATH".
 #
 # Usage:
 #   bash scripts/preflight.sh
@@ -58,7 +69,7 @@ get_version() {
 }
 
 echo "======================================================================"
-echo "SATO SWARM -- MI300X Pod Preflight Check"
+echo "SATO SWARM -- Pod Preflight Check (architecture auto-detected)"
 echo "Host: $(hostname 2>/dev/null || echo unknown)   Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
 echo "Logs: $LOGDIR"
 echo "======================================================================"
@@ -107,21 +118,48 @@ fi
 echo ""
 
 # --------------------------------------------------------------------
-# 2. rocminfo -- confirm the GPU is actually visible to ROCm
+# 2. rocminfo -- confirm the GPU is actually visible to ROCm, and detect
+#    its REAL architecture. Does not assume gfx942 -- any AMD GPU that
+#    ROCm recognizes counts as a pass. DETECTED_ARCH is reused below for
+#    the hello-world compile.
 # --------------------------------------------------------------------
-echo "2. GPU visibility (rocminfo)"
+echo "2. GPU visibility + architecture detection"
+
+DETECTED_ARCH=""
+ROCMINFO_OUT=""
 
 if command -v rocminfo &>/dev/null; then
     ROCMINFO_OUT="$(rocminfo 2>&1)"
     echo "$ROCMINFO_OUT" > "$LOGDIR/rocminfo.log"
-    if echo "$ROCMINFO_OUT" | grep -qi "gfx942"; then
+fi
+
+# Prefer rocm_agent_enumerator when available -- purpose-built for exactly
+# this, one gfx code per agent (gfx000 = host/CPU placeholder, skip it).
+if command -v rocm_agent_enumerator &>/dev/null; then
+    DETECTED_ARCH=$(rocm_agent_enumerator 2>/dev/null | grep -E '^gfx[0-9a-fA-F]+$' | grep -v '^gfx000$' | head -n 1)
+fi
+
+# Fall back to parsing rocminfo's own output if rocm_agent_enumerator
+# wasn't available or found nothing.
+if [ -z "$DETECTED_ARCH" ] && [ -n "$ROCMINFO_OUT" ]; then
+    DETECTED_ARCH=$(echo "$ROCMINFO_OUT" | grep -oE 'gfx[0-9a-fA-F]+' | grep -v '^gfx000$' | head -n 1)
+fi
+
+if command -v rocminfo &>/dev/null; then
+    if [ -n "$DETECTED_ARCH" ]; then
         gpu_name=$(echo "$ROCMINFO_OUT" | grep -i "Marketing Name" | head -n 1 | sed 's/^[[:space:]]*//')
-        pass "rocminfo" "gfx942 (MI300X) detected. ${gpu_name:-see preflight_logs/rocminfo.log}"
+        pass "rocminfo" "GPU detected, architecture: $DETECTED_ARCH. ${gpu_name:-see preflight_logs/rocminfo.log}"
     else
-        fail "rocminfo" "ran, but 'gfx942' not found in output -- see preflight_logs/rocminfo.log (wrong instance type, or driver issue)"
+        fail "rocminfo" "ran, but no gfx architecture found in its output -- see preflight_logs/rocminfo.log"
     fi
 else
     fail "rocminfo" "not found on PATH"
+fi
+
+if [ -n "$DETECTED_ARCH" ]; then
+    echo "  Will compile the hello-world check below for: $DETECTED_ARCH"
+else
+    echo "  Could not auto-detect a GPU architecture -- hello-world compile below will fall back to --offload-arch=native"
 fi
 
 echo ""
@@ -143,19 +181,27 @@ __global__ void hello() { printf("Hello from GPU thread %d\n", threadIdx.x); }
 int main() { hello<<<1, 4>>>(); hipDeviceSynchronize(); return 0; }
 EOF
 
+# Use whatever was actually detected above -- NEVER a hardcoded arch.
+# --offload-arch=native asks the compiler itself to auto-detect the build
+# machine's GPU (supported on sufficiently recent ROCm compilers); it's
+# the fallback only when rocm_agent_enumerator AND rocminfo both failed
+# to identify anything.
+HELLO_ARCH="${DETECTED_ARCH:-native}"
+echo "  Compiling with --offload-arch=$HELLO_ARCH"
+
 if command -v hipcc &>/dev/null; then
-    if hipcc -O2 --offload-arch=gfx942 -o "$HELLO_BIN" "$HELLO_SRC" > "$LOGDIR/hello_compile.log" 2>&1; then
+    if hipcc -O2 "--offload-arch=$HELLO_ARCH" -o "$HELLO_BIN" "$HELLO_SRC" > "$LOGDIR/hello_compile.log" 2>&1; then
         HELLO_OUT="$("$HELLO_BIN" 2>&1)"
         HELLO_RC=$?
         echo "$HELLO_OUT" > "$LOGDIR/hello_run.log"
         if [ "$HELLO_RC" -eq 0 ] && echo "$HELLO_OUT" | grep -q "Hello from GPU"; then
             n_lines=$(echo "$HELLO_OUT" | grep -c "Hello from GPU")
-            pass "hip_hello_world" "compiled, ran, printed from device ($n_lines/4 threads confirmed) -- see preflight_logs/hello_run.log"
+            pass "hip_hello_world" "compiled for $HELLO_ARCH, ran, printed from device ($n_lines/4 threads confirmed) -- see preflight_logs/hello_run.log"
         else
-            fail "hip_hello_world" "compiled but run failed or produced no device output (rc=$HELLO_RC) -- see preflight_logs/hello_run.log"
+            fail "hip_hello_world" "compiled for $HELLO_ARCH but run failed or produced no device output (rc=$HELLO_RC) -- see preflight_logs/hello_run.log. A segfault here (rc=139) usually means an ISA mismatch: the binary was compiled for a different architecture than the GPU actually present. Compare $HELLO_ARCH above against what rocminfo/rocm_agent_enumerator actually reported."
         fi
     else
-        fail "hip_hello_world" "compilation failed -- see preflight_logs/hello_compile.log"
+        fail "hip_hello_world" "compilation for $HELLO_ARCH failed -- see preflight_logs/hello_compile.log"
     fi
 else
     fail "hip_hello_world" "skipped -- hipcc not found"

@@ -6,9 +6,11 @@ Usage:
     # Local development (mock — no AMD hardware required)
     SATOSWARM_MOCK=1 python scripts/test_baseline.py vectorAdd
 
-    # On real MI300X instance (after Day 0 verification)
+    # On a real AMD GPU instance (after preflight verification)
     python scripts/test_baseline.py vectorAdd
-    # (SATOSWARM_MOCK unset, or explicitly =0, means REAL mode)
+    # (SATOSWARM_MOCK unset, or explicitly =0, means REAL mode. The target
+    #  GPU architecture is auto-detected at compile time — gfx942, gfx1100,
+    #  whatever's actually present.)
 
 This runs the complete non-agent baseline end-to-end:
 - Creates isolated workspace
@@ -49,7 +51,7 @@ def main():
     print("=" * 72)
     print("SATO SWARM Baseline Test")
     print(f"Seed: {seed_id.value}")
-    print(f"Mode: {'MOCK (local dev)' if MOCK else 'REAL (MI300X)'}")
+    print(f"Mode: {'MOCK (local dev)' if MOCK else 'REAL (hardware, arch auto-detected)'}")
     print("=" * 72)
 
     job = JobState(seed_id=seed_id)
@@ -63,6 +65,7 @@ def main():
     print("\n[2/3] Pipeline finished.")
     print(f"  Status: {final_job.status}")
     print(f"  Final phase: {final_job.phase}")
+    print(f"  GPU architecture (auto-detected): {final_job.gpu_arch or 'not detected'}")
     print(f"  Messages logged: {len(final_job.messages)}")
     print(f"  Workspace: {final_job.workspace_dir}")
 
@@ -75,8 +78,11 @@ def main():
     d = final_job.metrics.derived
     print("\n--- Key Metrics ---")
     if d.achieved_bw_gbs:
-        eff = f"{d.efficiency_percent}%" if d.efficiency_percent is not None else "not computed"
-        print(f"  Achieved BW: {d.achieved_bw_gbs:.2f} GB/s  |  Efficiency: {eff} of {d.theoretical_peak_gbs} GB/s")
+        if d.efficiency_percent is not None:
+            eff = f"{d.efficiency_percent}% of {d.theoretical_peak_gbs:g} GB/s"
+        else:
+            eff = "not computed (no verified theoretical peak for this GPU architecture)"
+        print(f"  Achieved BW: {d.achieved_bw_gbs:.2f} GB/s  |  Efficiency: {eff}")
     if d.achieved_tflops:
         eff = f"{d.efficiency_tflops_percent}%" if d.efficiency_tflops_percent is not None else "not computed"
         print(f"  Achieved TFLOPS: {d.achieved_tflops:.2f}  |  Efficiency: {eff}")
@@ -106,7 +112,8 @@ def main():
     print("\nBaseline test complete.")
     if MOCK:
         print("   This was a MOCK run. For real hardware: unset SATOSWARM_MOCK (or set it to 0)")
-        print("   on a machine with hipify-clang, hipcc, and amd-smi on PATH (the MI300X pod).")
+        print("   on a machine with hipify-clang, hipcc, and amd-smi on PATH. The target GPU")
+        print("   architecture is auto-detected - no config needed for gfx942, gfx1100, etc.")
     print("=" * 72)
 
 

@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Day 0 Hardware Verification helper for SATO SWARM.
 
-Run this on the actual AMD MI300X instance (before/instead of the full
+Run this on the actual AMD GPU instance (before/instead of the full
 pipeline) to confirm the ROCm toolchain is actually present and working.
+Works on any ROCm-capable AMD GPU, not just MI300X — see also
+scripts/preflight.sh, which additionally auto-detects the real GPU
+architecture and compiles/runs a real HIP kernel end to end.
 This script always tries the real tools — it has no mock mode, since its
 entire purpose is a real-hardware sanity check.
 
@@ -31,7 +34,7 @@ def shutil_which(name: str) -> bool:
 
 def main() -> None:
     print("=" * 70)
-    print("SATO SWARM — Day 0 MI300X Verification")
+    print("SATO SWARM — Day 0 Hardware Verification")
     print("=" * 70)
     print(f"Python: {sys.version.split()[0]}")
     print(f"Working dir: {Path.cwd()}")
@@ -82,7 +85,8 @@ if torch.cuda.is_available():
         print("     mkdir -p /tmp/day0 && cp seeds/vectorAdd.cu /tmp/day0/")
         print("     cd /tmp/day0")
         print("     hipify-clang vectorAdd.cu -o .")
-        print("     hipcc -O3 --offload-arch=gfx942 -o vectorAdd_hip *.hip.cpp")
+        print("     rocminfo | grep -o 'gfx[0-9a-fA-F]*' | grep -v gfx000   # find your real arch first")
+        print("     hipcc -O3 --offload-arch=<arch from above, or 'native'> -o vectorAdd_hip *.hip.cpp")
         print("     amd-smi metric --json > before.json")
         print("     ./vectorAdd_hip")
         print("     amd-smi metric --json > during.json")

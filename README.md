@@ -1,17 +1,20 @@
 # SATO SWARM
 
 Autonomous CUDA -> AMD ROCm/HIP migration pipeline, built to run and prove
-itself on real AMD Instinct MI300X hardware.
+itself on real AMD GPU hardware.
 
 SWARM = Swarm WorkForce Autonomous ReFActoring Migration.
 
 Given a self-contained CUDA seed, the pipeline: copies it into an isolated
-workspace, runs `hipify-clang`, compiles with `hipcc` for `gfx942`, runs the
-resulting binary, captures live `amd-smi` telemetry, computes achieved
-bandwidth/TFLOPS vs. MI300X's theoretical peaks, and writes a migration
-report + a downloadable artifacts tarball. Every number in that report is
-either a real measurement or explicitly labeled "Not captured" — nothing is
-ever a guessed placeholder presented as real.
+workspace, runs `hipify-clang`, compiles with `hipcc` for whichever GPU
+architecture is actually detected on the machine (MI300X, RDNA3, whatever
+— never hardcoded), runs the resulting binary, captures live `amd-smi`
+telemetry, computes achieved bandwidth/TFLOPS vs. that GPU's real
+theoretical peaks (when known), and writes a migration report + a
+downloadable artifacts tarball. Every number in that report is either a
+real measurement or explicitly labeled "Not captured" — nothing is ever a
+guessed placeholder presented as real, and no metric is ever computed
+against the wrong hardware's spec sheet.
 
 ## Quick start
 
@@ -23,7 +26,7 @@ $env:SATOSWARM_MOCK = "1"
 python scripts/test_baseline.py vectorAdd
 ```
 
-## Running for real, on the MI300X pod
+## Running for real, on the pod
 
 ```bash
 pip install -r requirements.txt
@@ -50,7 +53,7 @@ rather than re-reading the environment, so there's a single source of truth.
 
 | `SATOSWARM_MOCK` | Behavior |
 |---|---|
-| `1` | MOCK — no subprocess calls at all. Every tool function returns simulated MI300X-shaped data. |
+| `1` | MOCK — no subprocess calls at all. Every tool function returns simulated GPU-shaped data. |
 | `0`, or **unset** | REAL — `hipify-clang`, `hipcc`, and `amd-smi` are actually invoked via subprocess. |
 
 **Real is the default.** If the variable is ever lost or misconfigured on
@@ -58,11 +61,51 @@ the pod, the pipeline tries real tools and fails loudly and cleanly
 (a normal `FAILED` job with a real error message) rather than silently
 producing mock data that could be mistaken for a genuine hardware result.
 
+## How the target GPU architecture is detected
+
+`hipcc` needs `--offload-arch=<gfxNNNN>` to compile — and getting that
+wrong doesn't fail the build, it produces a binary that **segfaults at
+launch** on hardware whose ISA doesn't match what was compiled for. This
+project provisioned a pod expecting an MI300X (`gfx942`) and got an
+RDNA3/Radeon 7900-class card (`gfx1100`) instead — real ROCm hardware,
+just not the architecture that was hardcoded at the time, and the
+hello-world check segfaulted exactly as described above. Nothing in this
+codebase hardcodes an architecture anymore.
+
+`src/tools/execution.py`'s `detect_gpu_arch()` is the single source of
+truth, tried in order:
+1. `rocm_agent_enumerator` — purpose-built for this, one gfx code per
+   agent (`gfx000` is the host/CPU placeholder and is skipped).
+2. `rocminfo` — falls back to scanning its output for any `gfxNNNN` token.
+3. If both come up empty, `run_hipcc()` falls back to
+   `--offload-arch=native`, letting the compiler itself auto-detect the
+   build machine's GPU (supported on sufficiently recent ROCm compilers).
+
+Whatever was actually used is recorded on `job.gpu_arch` and shown in
+every message and in the report's `**Hardware**` line — never assumed,
+never silently defaulted to a specific chip. `scripts/preflight.sh` runs
+the same detection before compiling its hello-world check, so a
+architecture mismatch shows up there, in seconds, instead of partway
+through a real pipeline run.
+
+**Efficiency percentages follow the same rule.** `src/baseline/pipeline.py`'s
+`GPU_THEORETICAL_PEAKS` dict maps a detected architecture to its real
+spec-sheet numbers (HBM bandwidth, FP32 TFLOPS) — currently just
+`gfx942` (MI300X). If the detected architecture isn't in that table (e.g.
+`gfx1100` right now — its exact SKU wasn't confirmed against the pod when
+this was written), `efficiency_percent` / `efficiency_tflops_percent`
+stay `None` — "Not applicable" in the report — rather than divide a real
+achieved number by another GPU's peak and print a meaningless percentage.
+Add a verified entry to that dict for any architecture you want efficiency
+computed for; `achieved_bw_gbs` / `achieved_tflops` themselves are
+unaffected either way, since those come straight from the binary's own
+measured output.
+
 ## Seeds
 
 Three self-contained CUDA kernels in `seeds/`:
 
-- `vectorAdd.cu` — memory-bandwidth-bound, targets MI300X's ~5.3 TB/s HBM3 peak
+- `vectorAdd.cu` — memory-bandwidth-bound (e.g. ~5.3 TB/s HBM3 on MI300X — see the architecture-detection section below for how the actual peak used depends on the detected GPU)
 - `tiledMatmul.cu` — compute-bound, shared-memory tiling, targets FP32 TFLOPS peak
 - `reduction.cu` — control flow, `__syncthreads`, atomics
 
@@ -110,8 +153,8 @@ in the report table, on top of the page-level "Mode: MOCK" banner.
 ## Known limitation: amd-smi metric parsing
 
 `amd-smi metric --json`'s schema varies across ROCm releases, and
-`src/tools/execution.py`'s `_parse_amd_smi_json()` was written without a
-real MI300X to validate the exact key names against. It tries several
+`src/tools/execution.py`'s `_parse_amd_smi_json()` was written without
+real hardware to validate the exact key names against. It tries several
 plausible field paths; anything it can't confidently find is left as `None`
 and the report shows "Not captured" — never a guessed number. The raw
 `amd-smi` text is always saved to `logs/amd_smi_pre.txt` /
@@ -130,9 +173,9 @@ parser's accuracy.
 ```
 src/
   models/job.py        Job state, metrics, and report schema (Pydantic)
-  tools/execution.py    hipify / hipcc / amd-smi / binary-run wrappers — the mock/real switch lives here
+  tools/execution.py    hipify / hipcc / amd-smi / binary-run wrappers — mock/real switch + GPU arch auto-detection live here
   workspace/manager.py  Per-job isolated workspace (jobs/<job_id>/...)
-  baseline/pipeline.py  The port -> validate -> benchmark -> report flow
+  baseline/pipeline.py  The port -> validate -> benchmark -> report flow + GPU_THEORETICAL_PEAKS
 seeds/                  Self-contained CUDA test kernels
 scripts/
   preflight.sh           Pod toolchain check — versions + rocminfo + a real HIP compile/run (run this first)
@@ -144,5 +187,7 @@ RUNBOOK.md               Full copy-paste pod deployment sequence + what to save 
 ## Requirements
 
 Runtime dependency: `pydantic>=2.9.0`. That's it — everything else is
-Python standard library. On the MI300X pod, `hipify-clang`, `hipcc`, and
-`amd-smi` need to be on `PATH`.
+Python standard library. On the pod (whatever AMD GPU it turns out to
+have), `hipify-clang`, `hipcc`, `amd-smi`, `rocminfo`, and ideally
+`rocm_agent_enumerator` need to be on `PATH` — `scripts/preflight.sh`
+checks all of them.

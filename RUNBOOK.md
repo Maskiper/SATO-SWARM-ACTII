@@ -1,4 +1,4 @@
-# SATO SWARM — MI300X Pod Deployment Runbook
+# SATO SWARM — Pod Deployment Runbook
 
 Exact copy-paste sequence for taking this project from a clean checkout to
 a verified real-hardware run, in order. Every command below is meant to be
@@ -61,10 +61,11 @@ bash scripts/preflight.sh
 ```
 
 Read the summary at the bottom. It checks `hipcc`, `hipify-clang`,
-`amd-smi`, `rocprofv3` (presence + version), `rocminfo` (GPU visible,
-looking for `gfx942`), and actually compiles + runs a trivial HIP kernel
-to prove the whole chain works end to end — not just that the binaries
-exist on PATH.
+`amd-smi`, `rocprofv3` (presence + version), `rocminfo` (GPU visible —
+whatever architecture it actually reports, gfx942/gfx1100/whatever, not
+assumed in advance), and actually compiles + runs a trivial HIP kernel
+*for that detected architecture* to prove the whole chain works end to
+end — not just that the binaries exist on PATH.
 
 - **All PASS** → continue to step 4.
 - **Any FAIL** → stop here. Check `preflight_logs/` for the specific
@@ -73,6 +74,15 @@ exist on PATH.
   Do not proceed to a real pipeline run with a failing preflight — you'll
   just get a `FAILED` job with "command not found," which preflight
   already told you more precisely.
+- **`hip_hello_world` fails with rc=139 specifically** → that's a segfault,
+  and it almost always means an architecture mismatch: the pod provisioned
+  a different GPU than expected (this has actually happened — an MI300X
+  request came back as an RDNA3/gfx1100 card instead). Check the PASS/FAIL
+  line for `rocminfo` above it in the same run — it names the architecture
+  that was actually detected and used. The pipeline itself doesn't have
+  this problem (architecture is auto-detected the same way at compile
+  time, every run), but if you see this it's worth confirming preflight's
+  detected architecture matches what you expect before proceeding.
 
 ## 4. Run the pipeline in MOCK mode first
 
@@ -162,3 +172,16 @@ means the binary ran but didn't print a `Kernel time:` line, which
 shouldn't happen if compilation and preflight both succeeded. Check
 `jobs/<job_id>/logs/run.log` for the actual raw output to see what the
 binary printed instead.
+
+## If the efficiency percentage shows "Not applicable"
+
+Expected, not a bug, whenever `job.gpu_arch` (shown in the report's
+`**Hardware**` line and in `state.json`) isn't gfx942 — `achieved_bw_gbs`
+and `achieved_tflops` are still real, measured numbers either way; only
+the percentage-of-theoretical-peak is withheld, because
+`src/baseline/pipeline.py`'s `GPU_THEORETICAL_PEAKS` table only has a
+verified entry for MI300X (`gfx942`) so far. If the pod's real
+architecture (check `preflight_logs/rocminfo.log` or the report's
+`**Hardware**` line) has a different, known spec sheet, add an entry to
+that dict with the real numbers to get the percentage computed on future
+runs.

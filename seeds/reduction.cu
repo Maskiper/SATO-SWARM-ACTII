@@ -2,7 +2,7 @@
 // SATO SWARM Seed 3: Parallel Reduction — Control flow, synchronization & atomics
 // Tree-style reduction with multiple passes or final atomic.
 // Good test for hipify handling of __syncthreads, volatile, atomics, and launch bounds.
-// Target: Demonstrate solid occupancy on gfx942.
+// Target: Demonstrate solid occupancy on the detected target GPU architecture.
 
 #include <stdio.h>
 #include <stdlib.h>

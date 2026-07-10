@@ -68,17 +68,24 @@ class RawMetrics(BaseModel):
 class DerivedMetrics(BaseModel):
     """Derived efficiency numbers.
 
-    theoretical_peak_gbs / theoretical_peak_tflops are AMD's published
-    MI300X spec sheet numbers (documented constants, not a measurement) —
-    verify against the exact instance during Day 0. achieved_* fields are
-    only ever populated from real parsed binary output, never guessed.
+    theoretical_peak_gbs / theoretical_peak_tflops are a real GPU's
+    published spec-sheet numbers (documented constants, not a
+    measurement) — but which numbers depend entirely on which GPU
+    architecture is actually detected at runtime (see JobState.gpu_arch
+    and src/baseline/pipeline.py's GPU_THEORETICAL_PEAKS). There is no
+    hardcoded default here: an MI300X's ~5300 GB/s peak would silently
+    misrepresent efficiency on, say, a gfx1100 card, so both fields stay
+    None (and efficiency_percent/efficiency_tflops_percent along with
+    them) unless the detected architecture has a known, verified entry in
+    that lookup table. achieved_* fields are only ever populated from
+    real parsed binary output, never guessed, independent of this.
     """
     achieved_bw_gbs: Optional[float] = None
-    theoretical_peak_gbs: float = 5300.0  # MI300X HBM3 spec — verify on instance
+    theoretical_peak_gbs: Optional[float] = None  # populated by arch-keyed lookup, or left None
     efficiency_percent: Optional[float] = None
 
     achieved_tflops: Optional[float] = None
-    theoretical_peak_tflops: float = 163.4  # FP32 spec — verify on instance
+    theoretical_peak_tflops: Optional[float] = None  # populated by arch-keyed lookup, or left None
     efficiency_tflops_percent: Optional[float] = None
 
     # None = the seed binary's own hipEventElapsedTime() line was not found
@@ -119,6 +126,11 @@ class JobState(BaseModel):
     # Porting details (for report + replay)
     hipify_command: Optional[str] = None
     hipcc_command: Optional[str] = None
+    # The actual GPU architecture (e.g. "gfx1100", "gfx942") hipcc compiled
+    # for on this run — auto-detected at runtime (see
+    # src/tools/execution.py's detect_gpu_arch()), never assumed. None if
+    # detection failed and compilation fell back to --offload-arch=native.
+    gpu_arch: Optional[str] = None
     repair_loops: int = 0
 
     # Validation
