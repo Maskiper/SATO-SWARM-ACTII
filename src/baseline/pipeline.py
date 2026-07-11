@@ -18,6 +18,15 @@ and never re-labels a lower-fidelity number (e.g. process wall-clock time)
 under a higher-fidelity name (e.g. "Kernel time", which means GPU-side
 hipEventElapsedTime() timing specifically — see _compute_derived_metrics).
 See src/tools/execution.py's MOCK flag docstring for the mock/real switch.
+
+REPAIR LOOP (additive — see _attempt_hipcc_repair()): when hipcc fails AND
+job.seed_id == SeedId.REPAIR_DEMO specifically, run_baseline() gives
+src/memory/loader.py's PortingMemory + src/agents/tools.py's ToolRegistry
+a bounded number of attempts to fix the real hipcc error and recompile,
+before falling through to the ordinary FAILED path. For the 3 original
+seeds (vectorAdd/tiledMatmul/reduction), this whole block is skipped by
+the seed_id check — their control flow is byte-for-byte what it was
+before the repair loop existed.
 """
 
 from __future__ import annotations
@@ -26,6 +35,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
+from src.agents.tools import ToolRegistry
+from src.memory.loader import PortingMemory
 from src.models.job import (
     AgentMessage,
     DerivedMetrics,
@@ -34,6 +45,7 @@ from src.models.job import (
     JobState,
     JobStatus,
     RawMetrics,
+    SeedId,
 )
 from src.tools.execution import (
     MOCK,
@@ -171,6 +183,177 @@ def _advance(job: JobState, phase: JobPhase, ws: WorkspaceManager) -> None:
     job.phase = phase
     job.updated_at = datetime.utcnow()
     ws.write_state(job)
+
+
+def _attempt_hipcc_repair(
+    job: JobState,
+    tools: ToolRegistry,
+    memory: PortingMemory,
+    hip_sources_relative: list[str],
+    out_binary_relative: str,
+    initial_hipcc_log: str,
+    job_msg: Callable[[str], None],
+    max_attempts: int = 3,
+) -> tuple[bool, str, str, str]:
+    """Try to repair a failed hipcc compile using PortingMemory's known
+    patterns, applied mechanically via ToolRegistry — up to max_attempts
+    total (across however many distinct patterns get tried, not per
+    pattern). Only ever called when SeedId.REPAIR_DEMO's hipcc genuinely
+    failed (see run_baseline()) — never runs for the 3 original seeds.
+
+    Per attempt:
+      1. Query memory.get_relevant_patterns(error_text) — error_text
+         starts as initial_hipcc_log, and becomes the LATEST hipcc log
+         after each failed retry, so a later attempt can react to
+         whatever the error looks like *now*, not the original one.
+      2. get_relevant_patterns() already filters to matches at/above its
+         own min_confidence threshold (default 0.65) — so "the top
+         remaining candidate" here already IS "a match above confidence
+         threshold" (see get_relevant_patterns()'s docstring for exactly
+         what that score means). A pattern already tried this call is
+         excluded from being picked again.
+      3. If the candidate has no 'auto_fix' field, it's skipped (logged
+         honestly, not applied) — see PortingMemory's module docstring
+         for why a repair loop must never guess a patch from 'hip_fix'
+         prose.
+      4. Otherwise, apply auto_fix's old_text/new_text via
+         tools.execute("apply_search_replace", ...) against whichever of
+         hip_sources_relative actually contains old_text (tries each in
+         turn; apply_search_replace itself fails cleanly, per-file, if
+         old_text isn't found or isn't unique there — see
+         src/agents/tools.py).
+      5. Recompile via tools.execute("run_hipcc", ...). Success ->
+         memory.add_pattern() records a NEW "confirmed_repair" pattern
+         (distinct from the original research-sourced one — see below)
+         and this function returns immediately. Failure -> loop to the
+         next attempt with the new hipcc output as the updated
+         error_text.
+
+    Returns (success, final_log, final_err, final_arch_used). On success,
+    the caller (run_baseline()) is expected to treat this exactly like an
+    ordinary first-try hipcc success — same downstream validate/
+    benchmark/report path, no special-casing. On failure (budget
+    exhausted, or no pattern ever matched), the caller falls through to
+    the pre-existing FAILED path unchanged.
+
+    Every job_msg() call here states only the mechanical action taken —
+    which pattern id matched, its stored confidence number, what was
+    patched, whether the recompile after that patch succeeded — never
+    language implying reasoning or judgment beyond the keyword-overlap
+    match get_relevant_patterns() actually performed.
+    """
+    error_text = initial_hipcc_log
+    tried_pattern_ids: set[str] = set()
+    final_log, final_err, final_arch = initial_hipcc_log, "", ""
+
+    for attempt_num in range(1, max_attempts + 1):
+        candidates = [
+            p for p in memory.get_relevant_patterns(error_text, top_k=5, min_confidence=0.65)
+            if p.get("id") not in tried_pattern_ids
+        ]
+        if not candidates:
+            job_msg(
+                f"Repair attempt {attempt_num}/{max_attempts}: no untried pattern in memory "
+                f"matches this hipcc error above the confidence threshold (checked against "
+                f"{len(memory)} known patterns via keyword-overlap scoring). Stopping repair "
+                f"attempts."
+            )
+            break
+
+        pattern = candidates[0]
+        tried_pattern_ids.add(pattern.get("id", f"unnamed_pattern_{attempt_num}"))
+        auto_fix = pattern.get("auto_fix")
+
+        if not auto_fix or "old_text" not in auto_fix or "new_text" not in auto_fix:
+            job_msg(
+                f"Repair attempt {attempt_num}/{max_attempts}: pattern {pattern.get('id')!r} "
+                f"matched this error via keyword-overlap scoring (stored confidence "
+                f"{pattern.get('confidence', 'unknown')}), but it has no auto_fix "
+                f"old_text/new_text pair recorded, so it cannot be applied mechanically. "
+                f"Skipping to the next candidate."
+            )
+            continue
+
+        job_msg(
+            f"Repair attempt {attempt_num}/{max_attempts}: matched pattern {pattern.get('id')!r} "
+            f"(stored confidence {pattern.get('confidence', 'unknown')}) against the real hipcc "
+            f"error text via keyword-overlap scoring — not semantic reasoning. Applying its "
+            f"recorded auto_fix via apply_search_replace."
+        )
+
+        patched_file = None
+        patch_error = None
+        for candidate_file in hip_sources_relative:
+            patch_result = tools.execute(
+                "apply_search_replace",
+                relative_path=candidate_file,
+                old_text=auto_fix["old_text"],
+                new_text=auto_fix["new_text"],
+            )
+            if patch_result["success"]:
+                patched_file = candidate_file
+                break
+            patch_error = patch_result["error"]
+
+        if patched_file is None:
+            job_msg(
+                f"Repair attempt {attempt_num}/{max_attempts}: pattern {pattern.get('id')!r}'s "
+                f"auto_fix old_text was not found in any of {hip_sources_relative} "
+                f"({patch_error}). No change made. Skipping to the next candidate."
+            )
+            continue
+
+        job_msg(
+            f"Repair attempt {attempt_num}/{max_attempts}: patch applied to {patched_file} "
+            f"(pattern {pattern.get('id')!r}). Recompiling with hipcc."
+        )
+
+        compile_result = tools.execute(
+            "run_hipcc", hip_sources=hip_sources_relative, out_binary=out_binary_relative
+        )
+        result = compile_result.get("result") or {}
+        final_log = result.get("log", final_log)
+        final_arch = result.get("arch_used", final_arch)
+
+        if compile_result["success"]:
+            job_msg(
+                f"Repair attempt {attempt_num}/{max_attempts}: recompile SUCCEEDED after "
+                f"applying pattern {pattern.get('id')!r} (target arch: {final_arch})."
+            )
+            memory.add_pattern({
+                "id": f"confirmed_repair_{pattern.get('id')}_{job.job_id}",
+                "cuda": pattern.get("cuda", ""),
+                "hip_fix": pattern.get("hip_fix", ""),
+                "auto_fix": auto_fix,
+                "category": "confirmed_repair",
+                "confidence": 0.99,
+                "explanation": (
+                    f"Empirically confirmed: applying {pattern.get('id')!r}'s auto_fix to job "
+                    f"{job.job_id} (seed {job.seed_id.value}) made a real, previously-failing "
+                    f"hipcc compile succeed on attempt {attempt_num}/{max_attempts}."
+                ),
+                "source": (
+                    f"Confirmed by src/baseline/pipeline.py's repair loop, job {job.job_id}, "
+                    f"{'MOCK-mode' if MOCK else 'real'} hipcc, "
+                    f"{datetime.utcnow().isoformat()}Z. Derived from {pattern.get('id')!r}."
+                ),
+                "source_pattern_id": pattern.get("id"),
+                "confirmed_job_id": job.job_id,
+            })
+            return True, final_log, "", final_arch
+
+        final_err = compile_result.get("error") or result.get("stderr", "")
+        job_msg(
+            f"Repair attempt {attempt_num}/{max_attempts}: recompile still FAILED after "
+            f"applying pattern {pattern.get('id')!r}. hipcc error: {final_err[:300]}"
+        )
+        error_text = final_log  # react to the new error on the next attempt, not the old one
+
+    job_msg(
+        f"Repair loop exhausted (budget: {max_attempts} attempts) without a successful "
+        f"recompile. Falling through to the standard FAILED report path."
+    )
+    return False, final_log, final_err, final_arch
 
 
 def _compute_derived_metrics(
@@ -320,6 +503,38 @@ def run_baseline(
     # as FAILED, and a genuine failure would be reported as COMPLETED with
     # the pipeline then trying to run a binary that was never built.
     compile_success = ok
+
+    # Repair loop — ADDITIVE, and only for SeedId.REPAIR_DEMO. For the 3
+    # original seeds, job.seed_id is never REPAIR_DEMO, so this entire
+    # block (including constructing ToolRegistry/PortingMemory) never
+    # executes and their control flow is exactly what it was before this
+    # existed. See _attempt_hipcc_repair()'s docstring for the full
+    # attempt-by-attempt behavior.
+    if not compile_success and job.seed_id == SeedId.REPAIR_DEMO:
+        hip_sources_relative = [str(p.relative_to(ws_dir)).replace("\\", "/") for p in hip_files]
+        out_binary_relative = str(binary.relative_to(ws_dir)).replace("\\", "/")
+        repair_tools = ToolRegistry(job_id=job.job_id, workspace_dir=ws_dir)
+        repair_memory = PortingMemory()
+        _append_message(
+            job, "Repair Loop", "thought",
+            f"hipcc failed for {job.seed_id.value}, a repair-loop-enabled seed. Querying "
+            f"PortingMemory ({len(repair_memory)} known patterns) for a fix before falling "
+            f"back to a diagnostic FAILED report.",
+        )
+        repaired, repair_log, repair_err, repair_arch = _attempt_hipcc_repair(
+            job, repair_tools, repair_memory, hip_sources_relative, out_binary_relative, log,
+            job_msg=lambda text: _append_message(job, "Repair Loop", "observation", text),
+        )
+        if repaired:
+            ok, log, err = True, repair_log, repair_err
+            arch_used = repair_arch or arch_used
+            (ws_dir / "logs" / "hipcc.log").write_text(log, encoding="utf-8")
+            job.gpu_arch = arch_used
+            job.hipcc_command = (
+                f"hipcc -O3 --offload-arch={arch_used} ... -o {binary.name}"
+                f"  (after repair loop — see the job's message trace for what was patched)"
+            )
+            compile_success = True
 
     if not compile_success and not MOCK:
         job.status = JobStatus.FAILED

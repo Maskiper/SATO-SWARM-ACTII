@@ -36,6 +36,12 @@ class SeedId(str, Enum):
     VECTOR_ADD = "vectorAdd"
     TILED_MATMUL = "tiledMatmul"
     REDUCTION = "reduction"
+    # Intentional compile-time-gap test case for the repair loop (see
+    # src/baseline/pipeline.py's _attempt_hipcc_repair()) — not a
+    # benchmark seed. Direct-filename lookup in
+    # WorkspaceManager.copy_seed() finds seeds/repairDemo.cu without
+    # needing an entry in that method's fallback mapping dict.
+    REPAIR_DEMO = "repairDemo"
 
 
 class AgentMessage(BaseModel):
