@@ -180,8 +180,12 @@ def main() -> None:
         "CHECK_CUDA(cudaCtxResetPersistingL2Cache())" not in patched_content,
     )
     check(
-        "the rest of the file (hipMalloc etc.) is untouched",
-        "hipMalloc" in patched_content and "hipDeviceSynchronize" in patched_content,
+        # hipDeviceSynchronize is NOT expected here as of the timing/
+        # validation instrumentation added to repairDemo.cu — the standalone
+        # sync call was removed as redundant once cudaEventSynchronize(stop)
+        # was added (same structure vectorAdd.cu/tiledMatmul.cu already use).
+        "the rest of the file (hipMalloc, hipEventSynchronize etc.) is untouched",
+        "hipMalloc" in patched_content and "hipEventSynchronize" in patched_content,
     )
     check(
         "a log message named the correct pattern id",

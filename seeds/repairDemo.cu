@@ -3,11 +3,12 @@
 //
 // THIS IS NOT A HIDDEN TRICK. This file is deliberately constructed to
 // fail at one specific, well-understood, VERIFIED-real step, for testing
-// an automated repair loop (future work — not built yet; see
-// src/agents/tools.py's apply_search_replace, the mechanism a repair
-// loop will eventually use to apply the fix in
-// memory/porting_patterns.jsonl's "gap_cudaCtxResetPersistingL2Cache"
-// entry). Nothing else in this file is unusual on purpose.
+// the automated repair loop (src/baseline/pipeline.py's
+// _attempt_hipcc_repair(), built and tested — see scripts/test_repair_loop.py).
+// It uses src/agents/tools.py's apply_search_replace to apply the fix
+// recorded in memory/porting_patterns.jsonl's
+// "gap_cudaCtxResetPersistingL2Cache" entry's auto_fix field. Nothing
+// else in this file is unusual on purpose.
 //
 // THE GAP (verified against real, live source — not invented):
 //
@@ -92,8 +93,24 @@ int main(void) {
   int* d_flag;
   CHECK_CUDA(cudaMalloc(&d_flag, sizeof(int)));
 
+  cudaEvent_t start, stop;
+  CHECK_CUDA(cudaEventCreate(&start));
+  CHECK_CUDA(cudaEventCreate(&stop));
+
+  CHECK_CUDA(cudaEventRecord(start));
   trivialKernel<<<1, 32>>>(d_flag);
-  CHECK_CUDA(cudaDeviceSynchronize());
+  CHECK_CUDA(cudaEventRecord(stop));
+  CHECK_CUDA(cudaEventSynchronize(stop));
+
+  float ms = 0.0f;
+  CHECK_CUDA(cudaEventElapsedTime(&ms, start, stop));
+
+  int h_flag = 0;
+  CHECK_CUDA(cudaMemcpy(&h_flag, d_flag, sizeof(int), cudaMemcpyDeviceToHost));
+  printf("Flag check: %d (expected %d)\n", h_flag, 1);
+
+  printf("\n=== repairDemo Timing ===\n");
+  printf("Kernel time: %.3f ms\n", ms);
 
   // THE INTENTIONAL GAP -- see the file header comment above for the
   // full verified evidence. hipify-perl leaves this line completely
@@ -101,6 +118,8 @@ int main(void) {
   CHECK_CUDA(cudaCtxResetPersistingL2Cache());
 
   CHECK_CUDA(cudaFree(d_flag));
+  CHECK_CUDA(cudaEventDestroy(start));
+  CHECK_CUDA(cudaEventDestroy(stop));
   printf("repairDemo seed completed successfully.\n");
   return 0;
 }

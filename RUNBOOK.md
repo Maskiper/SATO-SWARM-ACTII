@@ -216,3 +216,79 @@ which path a given run took:
   query nor the fallback table could produce a number for this
   architecture. `logs/gpu_specs.log` shows exactly what was tried and
   what came back, for debugging.
+
+---
+
+## Running the local stack (backend + frontend) — NOT a pod deployment
+
+Everything above this line is the pod deployment sequence: get onto real
+AMD GPU hardware, run the CLI (`scripts/test_baseline.py`), capture proof
+files. **This section is a completely separate, local-only workflow** —
+a FastAPI backend (`src/main.py`) + Next.js frontend (`frontend/`) that
+run on your own machine (Windows, Mac, whatever — no ROCm/AMD GPU
+required if run in MOCK mode) and give you a browser UI for watching a
+job run live instead of reading CLI output.
+
+**This stack is not deployed to the pod, and deploying it there is
+neither currently supported nor needed.** The pod's job is to run the
+actual CUDA -> HIP pipeline and produce real measurements; this local
+stack is a viewer/demo layer on top of that, and it's equally useful
+pointed at a fresh MOCK-mode local run or at the 4 real job directories
+already pulled back from the pod (via **Replay real run**, below),
+without the pod itself needing to be reachable at all.
+
+### 1. Start the backend
+
+```powershell
+cd sato-swarm-actii
+pip install -r requirements.txt      # now also installs fastapi + uvicorn, not just pydantic
+$env:SATOSWARM_MOCK = "1"            # or unset/0 if THIS machine has ROCm + a real GPU on it
+python -m uvicorn src.main:app --host 127.0.0.1 --port 8000
+```
+
+Confirm it's up: `curl.exe http://127.0.0.1:8000/health` should return
+JSON with `"system": "SATO SWARM"` and the mode you just set.
+
+### 2. Start the frontend
+
+In a second terminal:
+
+```powershell
+cd sato-swarm-actii/frontend
+npm install
+npm run dev
+```
+
+Open `http://localhost:3000`. The page's health line at the top shows
+the **backend's current mode** — this describes what a *new* run would
+use, not any specific job you might view below it (see README.md's
+`job.mode` section for why those two are deliberately independent, and
+can legitimately disagree).
+
+### 3. What you can do from the UI
+
+- **Run** a seed — starts a brand-new job against whatever mode the
+  backend is currently running as. Same `run_baseline()` the CLI itself
+  uses under the hood — nothing pipeline-side is reimplemented for the
+  API path (see README.md's FastAPI section, and `scripts/test_main.py`'s
+  CLI/API equivalence test).
+- **Replay real run** — loads one of the 4 actual, already-completed
+  real-hardware job directories (the ones pulled back from the pod via
+  the `scp`/`rsync` steps earlier in this document) through
+  `/demo/replay`. Works even when the backend itself is running in MOCK
+  mode, and never runs anything new — it only reads the
+  `jobs/<job_id>/state.json` + `migration_report.md` that already exist
+  in this checkout. If a given seed's real job directory isn't present
+  here, the UI surfaces the same plain 404 message `/demo/replay` itself
+  returns, rather than silently substituting mock data.
+
+### Ports and CORS (local-only, by design)
+
+The backend binds `127.0.0.1:8000` only (never `0.0.0.0`), and its CORS
+allowlist is hardcoded to `localhost:3000`/`127.0.0.1:3000` — the default
+Next.js dev server port (the `allow_origins=[...]` list passed to
+`CORSMiddleware` in `src/main.py`). If you need a different frontend
+port, either free up 3000 first or edit that list directly — left
+un-generalized on purpose, since this whole stack is local-only by
+design (see `src/main.py`'s own module docstring). It is not intended to
+be exposed beyond this machine as-is.

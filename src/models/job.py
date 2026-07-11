@@ -133,6 +133,18 @@ class JobState(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
+    # THIS job's own recorded mode — set once in run_baseline() from the
+    # same MOCK constant (src/tools/execution.py) that governs everything
+    # else in that run, and never touched again afterward. Deliberately
+    # NOT re-derived from whatever the server happens to be running as
+    # later (e.g. when a job is replayed) — a real job stays recorded as
+    # real even if viewed from a server that's currently in MOCK mode.
+    # Default "MOCK" exists only so older state.json files written before
+    # this field existed still load (Pydantic falls back to the default
+    # on a missing key) — see the one-time backfill for the 4 real
+    # pre-existing job dirs this was retrofitted onto.
+    mode: Literal["MOCK", "REAL"] = "MOCK"
+
     # Execution trace
     messages: list[AgentMessage] = Field(default_factory=list)
     completed_phases: list[JobPhase] = Field(default_factory=list)

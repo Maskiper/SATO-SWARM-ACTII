@@ -455,6 +455,10 @@ def run_baseline(
     """
     ws_dir = ws.create_workspace(job)
     job.workspace_dir = str(ws_dir)
+    # This job's own recorded mode — set once, here, from the same MOCK
+    # constant governing everything else below, never touched again (see
+    # JobState.mode's docstring in src/models/job.py).
+    job.mode = "MOCK" if MOCK else "REAL"
 
     _append_message(job, "Baseline Orchestrator", "thought", f"Starting baseline pipeline for {job.seed_id.value} on {'MOCK (local dev)' if MOCK else 'a real AMD GPU'} environment. Planning steps: analyze -> port -> validate -> benchmark -> report.")
     ws.write_state(job)

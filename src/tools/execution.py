@@ -274,9 +274,15 @@ def run_hipcc(hip_sources: list[Path], out_binary: Path, arch: Optional[str] = N
 
 
 def _try_float(value: Any) -> Optional[float]:
-    """Pull a float out of a raw number or a unit-suffixed string like
-    '45 %' / '300.5 W' / '62 C' (amd-smi often embeds units in strings).
-    Returns None (never a guess) if nothing numeric is found.
+    """Pull a float out of a raw number, a unit-suffixed string like
+    '45 %' / '300.5 W' / '62 C', or amd-smi's current JSON schema's
+    {"value": <number-or-string>, "unit": "..."} wrapper — CONFIRMED
+    real, on every single numeric reading, in `amd-smi metric --json` /
+    `amd-smi metric --clock --json` / `amd-smi static --vram --json`
+    output pulled from a real gfx1100 pod (jobs/job_374d6e8c51d1 and
+    others, 2026-07-xx) — e.g. clock.mem_0.max_clk is literally
+    {"value": 1124, "unit": "MHz"}, not a bare 1124. Returns None (never
+    a guess) if nothing numeric is found anywhere in `value`.
     """
     if value is None:
         return None
@@ -286,13 +292,44 @@ def _try_float(value: Any) -> Optional[float]:
         m = re.search(r"[-+]?\d*\.?\d+", value)
         if m:
             return float(m.group(0))
+    if isinstance(value, dict) and "value" in value:
+        return _try_float(value["value"])
     return None
+
+
+def _unwrap_amd_smi_gpu_node(data: Any) -> Any:
+    """amd-smi --json output has been seen in two top-level shapes: a bare
+    list of per-GPU objects (`[{"usage": ...}, ...]`), and — CONFIRMED
+    real, current amd-smi (jobs/job_374d6e8c51d1 and others, 2026-07-xx,
+    both `amd-smi metric --json` and `amd-smi metric --clock --json` and
+    `amd-smi static --vram --json`) — a dict wrapping that same list
+    under a "gpu_data" key: `{"gpu_data": [{"gpu": 0, "usage": ...,
+    "clock": ..., "vram": ...}, ...]}`. Neither _dig() nor a bare
+    isinstance(data, list) check accounts for the second, real shape —
+    this is why _parse_amd_smi_json() and _query_amd_smi_mem_bus_specs()
+    both came back completely empty against real amd-smi output despite
+    trying otherwise-correct key names (see the real key-path fixes
+    alongside this function's call sites).
+
+    Returns the first per-GPU dict either way (multi-GPU: takes index 0,
+    same "assume single GPU, take the first" convention _dig() already
+    used), or the original value unchanged if it matches neither shape —
+    callers' existing isinstance()/. get() checks then simply find
+    nothing, exactly as before this helper existed.
+    """
+    if isinstance(data, dict) and isinstance(data.get("gpu_data"), list) and data["gpu_data"]:
+        return data["gpu_data"][0]
+    if isinstance(data, list) and data:
+        return data[0]
+    return data
 
 
 def _dig(node: Any, *path: str) -> Any:
     """Walk a nested dict (unwrapping a leading list, since amd-smi --json
     often returns a top-level list of per-GPU objects) by key path.
-    Returns None on any miss instead of raising.
+    Returns None on any miss instead of raising. Does NOT unwrap a
+    "gpu_data"-wrapped dict — call _unwrap_amd_smi_gpu_node() on the raw
+    parsed JSON first if it might be that shape (real amd-smi output is).
     """
     for key in path:
         if isinstance(node, list):
@@ -306,50 +343,89 @@ def _dig(node: Any, *path: str) -> Any:
     return node
 
 
+def _first_non_none(*values: Optional[float]) -> Optional[float]:
+    """Return the first value that is actually not None — NOT the first
+    truthy value. `a or b or c` looks equivalent but silently breaks the
+    moment any real reading is exactly 0.0 (Python: `0.0 or x` evaluates
+    to `x`, not `0.0`) — CONFIRMED a real, live bug against real amd-smi
+    output: vectorAdd's real "pre" snapshot (jobs/job_374d6e8c51d1/logs/
+    amd_smi_pre.txt) has gfx_activity=0% and clock.gfx_0.clk=0MHz (GPU
+    genuinely idle before the kernel launches) — both real, valid,
+    meaningful 0.0 readings that `or`-chaining was discarding in favor of
+    a nonexistent fallback key, wrongly ending up None ("not captured")
+    instead of the real captured 0.0. Never triggered before this because
+    mock mode's simulated telemetry never happens to use exactly 0.
+    """
+    for v in values:
+        if v is not None:
+            return v
+    return None
+
+
 def _parse_amd_smi_json(raw_text: str) -> RawMetrics:
     """Best-effort parse of `amd-smi metric --json` output into RawMetrics.
 
-    IMPORTANT: amd-smi's JSON schema varies across ROCm releases, and this
-    parser was written without a real MI300X to validate the exact key
-    names against. It tries several plausible key paths per field; any
-    field it can't confidently find is left as None (RawMetrics fields are
-    all Optional — missing means "not captured", never a guessed number).
+    Key paths below are CONFIRMED against real `amd-smi metric --json`
+    output from a real gfx1100 pod — jobs/job_374d6e8c51d1 (vectorAdd),
+    job_7eeb1f8358f8 (tiledMatmul), job_09ef95c5f62b (reduction),
+    2026-07-xx, all three independently showing the identical structure.
+    Real shape: `{"gpu_data": [{"usage": {"gfx_activity": {"value": N,
+    "unit": "%"}, ...}, "power": {"socket_power": {"value": N, "unit":
+    "W"}, ...}, "temperature": {"edge": {"value": N, "unit": "C"}, ...},
+    "mem_usage": {"used_vram": {"value": N, "unit": "MB"}, ...}, "clock":
+    {"gfx_0": {"clk": {"value": N, "unit": "MHz"}, ...}, "mem_0": {"clk":
+    {"value": N, "unit": "MHz"}, ...}, ...}}]}` — i.e. everything lives
+    under a top-level "gpu_data" array (see _unwrap_amd_smi_gpu_node()),
+    every numeric reading is {"value": ..., "unit": ...} (see
+    _try_float()'s dict-unwrap branch), memory usage is "used_vram" (not
+    "used"), and current gfx/mem clock is nested one level deeper under
+    an indexed "gfx_0"/"mem_0" sub-key (there can be more than one gfx/
+    mem clock domain — gfx_1..gfx_7 exist as "N/A" placeholders on this
+    card — index 0 is the active one on every real capture seen).
+
+    Older/alternate key names are kept as fallback attempts (amd-smi's
+    schema has already been observed to vary across releases once — see
+    _try_float()/_unwrap_amd_smi_gpu_node()'s history), tried after the
+    confirmed-real ones. Any field found in neither shape stays None
+    (RawMetrics fields are all Optional — missing means "not captured",
+    never a guessed number).
 
     The raw text is always saved to logs/ regardless of what this parses
     (see pipeline.py), so nothing is lost even if every path below misses.
-
-    On Day 0: run `amd-smi metric --json` on the real pod, compare its
-    actual structure to the paths tried below, and add/fix key names here
-    if the parsed RawMetrics comes back empty.
     """
     try:
-        data = json.loads(raw_text)
+        parsed = json.loads(raw_text)
     except (json.JSONDecodeError, ValueError):
         return RawMetrics()
 
-    util = (
-        _try_float(_dig(data, "usage", "gfx_activity"))
-        or _try_float(_dig(data, "usage", "gpu_activity"))
+    data = _unwrap_amd_smi_gpu_node(parsed)
+
+    util = _first_non_none(
+        _try_float(_dig(data, "usage", "gfx_activity")),
+        _try_float(_dig(data, "usage", "gpu_activity")),
     )
-    power = (
-        _try_float(_dig(data, "power", "socket_power"))
-        or _try_float(_dig(data, "power", "average_socket_power"))
+    power = _first_non_none(
+        _try_float(_dig(data, "power", "socket_power")),
+        _try_float(_dig(data, "power", "average_socket_power")),
     )
-    temp = (
-        _try_float(_dig(data, "temperature", "edge"))
-        or _try_float(_dig(data, "temperature", "junction"))
+    temp = _first_non_none(
+        _try_float(_dig(data, "temperature", "edge")),
+        _try_float(_dig(data, "temperature", "junction")),
     )
-    mem = (
-        _try_float(_dig(data, "mem_usage", "used"))
-        or _try_float(_dig(data, "vram", "used"))
+    mem = _first_non_none(
+        _try_float(_dig(data, "mem_usage", "used_vram")),
+        _try_float(_dig(data, "mem_usage", "used")),
+        _try_float(_dig(data, "vram", "used")),
     )
-    sclk = (
-        _try_float(_dig(data, "clock", "sclk"))
-        or _try_float(_dig(data, "clock", "gfx_clk"))
+    sclk = _first_non_none(
+        _try_float(_dig(data, "clock", "gfx_0", "clk")),
+        _try_float(_dig(data, "clock", "sclk")),
+        _try_float(_dig(data, "clock", "gfx_clk")),
     )
-    mclk = (
-        _try_float(_dig(data, "clock", "mclk"))
-        or _try_float(_dig(data, "clock", "mem_clk"))
+    mclk = _first_non_none(
+        _try_float(_dig(data, "clock", "mem_0", "clk")),
+        _try_float(_dig(data, "clock", "mclk")),
+        _try_float(_dig(data, "clock", "mem_clk")),
     )
 
     return RawMetrics(
@@ -619,25 +695,35 @@ def _query_amd_smi_mem_bus_specs() -> tuple[Optional[float], Optional[float], Op
     higher-fidelity label (the same rule this file already applies
     everywhere else — see the module docstring at the top of this file).
 
-    Confirmed on a real ROCm install (RX 7900 XTX / gfx1100, 2026-07-xx):
-    `amd-smi metric --clock --json` reports memory clock under a
-    per-instance key like `mem_0` (not the bare `mem`/`mclk`/`memory`/
-    `vram` this originally only checked for) — real multi-die/multi-
-    channel GPUs may expose `mem_0`, `mem_1`, etc. _MEM_CLOCK_KEY_RE
-    matches any of the base names with an optional `_N` suffix; if
-    multiple instances are found, the MAXIMUM max_clk across all of them
-    is used (a defensible reading of "theoretical peak" if per-instance
-    binning ever differs — not expected to matter for typical single-
-    memory-domain consumer/datacenter cards).
+    Confirmed on a real ROCm install (RX 7900 XTX / gfx1100, 2026-07-xx,
+    jobs/job_1684fdb652d5/logs/gpu_specs.log): `amd-smi metric --clock
+    --json` reports memory clock under a per-instance key like `mem_0`
+    (not the bare `mem`/`mclk`/`memory`/`vram` this originally only
+    checked for) — real multi-die/multi-channel GPUs may expose `mem_0`,
+    `mem_1`, etc. _MEM_CLOCK_KEY_RE matches any of the base names with an
+    optional `_N` suffix; if multiple instances are found, the MAXIMUM
+    max_clk across all of them is used (a defensible reading of
+    "theoretical peak" if per-instance binning ever differs — not
+    expected to matter for typical single-memory-domain consumer/
+    datacenter cards).
+
+    Two ADDITIONAL real structural issues found the same way (both fixed
+    by _unwrap_amd_smi_gpu_node() / _try_float(), applied here): the whole
+    payload is wrapped in a top-level "gpu_data" array
+    (`{"gpu_data": [{"clock": ..., "vram": ...}]}`), and every numeric
+    reading — including max_clk itself — is `{"value": N, "unit": "..."}`,
+    not a bare number. Both were silently swallowing every field here
+    (the earlier `mem_0` key-name fix was necessary but not sufficient —
+    it never got a chance to run against real data, since the outer
+    "gpu_data" wrapper meant `node.get("clock")` found nothing at all).
 
     amd-smi's exact JSON schema still varies across ROCm releases beyond
     this (same caveat as _parse_amd_smi_json above), and memory bus width
     specifically may not be exposed by every version at all. This tries
     several plausible key paths for bus width and vram type and leaves
-    them None (never a guess) if nothing matches. If a value comes back
-    None despite the tool clearly reporting it under a different key,
-    compare the raw JSON logged here against the paths tried below and
-    add/fix the key names.
+    them None (never a guess) if nothing matches. `bit_width` is tried
+    first — the confirmed-real key (see gpu_specs.log above) — with the
+    other two kept as fallback attempts for other ROCm versions.
 
     IMPORTANT — the value found here for mem_clock_mhz does NOT directly
     equal real per-pin data rate for every memory technology; see
@@ -656,7 +742,7 @@ def _query_amd_smi_mem_bus_specs() -> tuple[Optional[float], Optional[float], Op
             data = json.loads(out)
         except (json.JSONDecodeError, ValueError):
             data = None
-        node = data[0] if isinstance(data, list) and data else data
+        node = _unwrap_amd_smi_gpu_node(data)
         clocks = node.get("clock") if isinstance(node, dict) else None
         candidates: list[dict] = []
         if isinstance(clocks, dict):
@@ -693,12 +779,13 @@ def _query_amd_smi_mem_bus_specs() -> tuple[Optional[float], Optional[float], Op
             data = json.loads(out)
         except (json.JSONDecodeError, ValueError):
             data = None
+        node = _unwrap_amd_smi_gpu_node(data)
         bus_width_bits = (
-            _try_float(_dig(data, "vram", "bus_width"))
-            or _try_float(_dig(data, "vram", "bit_width"))
-            or _try_float(_dig(data, "vram", "vram_bit_width"))
+            _try_float(_dig(node, "vram", "bit_width"))
+            or _try_float(_dig(node, "vram", "bus_width"))
+            or _try_float(_dig(node, "vram", "vram_bit_width"))
         )
-        raw_type = _dig(data, "vram", "type") or _dig(data, "vram", "vram_type")
+        raw_type = _dig(node, "vram", "type") or _dig(node, "vram", "vram_type")
         vram_type_raw = raw_type if isinstance(raw_type, str) else None
 
     return mem_clock_mhz, bus_width_bits, vram_type_raw, "\n".join(log_lines)
@@ -1087,6 +1174,12 @@ def parse_binary_output_for_metrics(stdout: str) -> dict:
     elif m := re.search(r"Sanity C\[0,0\]\s*=\s*([\d.]+)\s*\(expected\s*~?([\d.]+)\)", stdout):
         data["check_pairs"] = [(float(m.group(1)), float(m.group(2)))]
     elif m := re.search(r"Reduction result:\s*([\d.]+)\s*\(expected\s*([\d.]+)\)", stdout):
+        data["check_pairs"] = [(float(m.group(1)), float(m.group(2)))]
+    elif m := re.search(r"Flag check:\s*([\d.]+)\s*\(expected\s*([\d.]+)\)", stdout):
+        # seeds/repairDemo.cu — trivial single-flag kernel, not a
+        # bandwidth/TFLOPS benchmark seed. Its own printf label, not
+        # reused from vectorAdd/tiledMatmul/reduction's formats, which
+        # all describe something repairDemo's kernel doesn't do.
         data["check_pairs"] = [(float(m.group(1)), float(m.group(2)))]
     # Cross-check only — never used as the report's headline number:
     if m := re.search(r"Achieved bandwidth:\s*([\d.]+)\s*GB/s", stdout):
