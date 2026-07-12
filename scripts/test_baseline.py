@@ -37,7 +37,7 @@ from src.tools.execution import MOCK  # single source of truth for mock/real —
 def main():
     if len(sys.argv) < 2:
         print("Usage: python scripts/test_baseline.py <seed_id>")
-        print("Available seeds: vectorAdd, tiledMatmul, reduction")
+        print("Available seeds: vectorAdd, tiledMatmul, reduction, repairDemo, multiFileDemo")
         sys.exit(1)
 
     seed_arg = sys.argv[1]
@@ -45,7 +45,7 @@ def main():
         seed_id = SeedId(seed_arg)
     except ValueError:
         print(f"Invalid seed: {seed_arg}")
-        print("Valid: vectorAdd, tiledMatmul, reduction")
+        print("Valid: vectorAdd, tiledMatmul, reduction, repairDemo, multiFileDemo")
         sys.exit(1)
 
     print("=" * 72)

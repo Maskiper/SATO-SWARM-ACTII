@@ -51,6 +51,8 @@ from src.tools.execution import (
     MOCK,
     GpuTheoreticalPeaks,
     capture_amd_smi_snapshot,
+    check_rocm_library_available,
+    detect_cuda_library_includes,
     detect_gpu_theoretical_peaks,
     parse_binary_output_for_metrics,
     run_binary,
@@ -466,19 +468,74 @@ def run_baseline(
     # 1. Prepare
     _advance(job, JobPhase.ANALYSIS, ws)
     _append_message(job, "Baseline Analyzer", "action", "Copying self-contained seed into isolated workspace.")
-    src_cu = ws.copy_seed(job, seeds_root)
-    _append_message(job, "Baseline Analyzer", "observation", f"Detected {src_cu.name} ({src_cu.stat().st_size} bytes). Simple kernel pattern, low risk for port. 1 kernel found.")
+    src_files = ws.copy_seed(job, seeds_root)
+    if len(src_files) == 1:
+        src_cu = src_files[0]
+        _append_message(job, "Baseline Analyzer", "observation", f"Detected {src_cu.name} ({src_cu.stat().st_size} bytes). Simple kernel pattern, low risk for port. 1 kernel found.")
+    else:
+        total_bytes = sum(f.stat().st_size for f in src_files)
+        names = ", ".join(f.name for f in src_files)
+        _append_message(job, "Baseline Analyzer", "observation", f"Detected a {len(src_files)}-file project ({names}; {total_bytes} bytes total). Multi-file source, low risk for port.")
     if on_progress: on_progress(job)
+
+    # 1b. CUDA library detection — cublas_v2.h/cudnn.h/thrust/*/nccl.h
+    # only (see src/tools/execution.py's _CUDA_LIBRARY_MAPPINGS module
+    # comment for exactly why just these 4). Empty for the 4 original
+    # seeds and multiFileDemo, none of which reference any of them — this
+    # whole block is a genuine no-op for them, not just a quiet skip: the
+    # detection call itself still runs (cheap — a handful of regex
+    # scans), it just finds nothing, so hipify_extra_args/hipcc_link_flags
+    # stay empty and their commands are unchanged from before this
+    # existed.
+    detections = detect_cuda_library_includes(src_files[0].parent)
+    hipify_extra_args: list[str] = []
+    hipcc_link_flags: list[str] = []
+    if detections:
+        for d in detections:
+            available, detail = check_rocm_library_available(d)
+            d["available"] = available
+            d["availability_detail"] = detail
+            job.library_detections.append({
+                "cuda_header": d["cuda_header"],
+                "rocm_name": d["rocm_name"],
+                "rocm_header": d.get("rocm_header"),
+                "link_flag": d.get("link_flag"),
+                "available": available,
+                "availability_detail": detail,
+                "caveat": d.get("caveat"),
+            })
+            if d.get("link_flag"):
+                hipcc_link_flags.append(d["link_flag"])
+        hipify_extra_args = ["--roc"]
+        summary = "; ".join(
+            f"{d['rocm_name']} ({d['cuda_header']} -> {d.get('rocm_header') or 'no rewrite needed'}"
+            f"{', ' + d['link_flag'] if d.get('link_flag') else ''}) — "
+            f"installed on this machine: {d['available']} ({d['availability_detail']})"
+            for d in detections
+        )
+        _append_message(
+            job, "Baseline Analyzer", "observation",
+            f"CUDA library reference(s) detected in source: {summary}. "
+            f"Requesting hipify-perl's --roc translation and adding the matching hipcc link flag(s).",
+        )
+        for d in detections:
+            if d.get("caveat"):
+                _append_message(job, "Baseline Analyzer", "observation", f"{d['rocm_name']} caveat: {d['caveat']}")
+    hipcc_link_flags = sorted(set(hipcc_link_flags))
 
     # 2. hipify — tool is auto-selected inside run_hipify(): hipify-perl
     # preferred (no CUDA SDK needed, correct default on an AMD-only box),
     # hipify-clang only as a fallback when hipify-perl is missing AND a
-    # real CUDA install is actually present.
+    # real CUDA install is actually present. run_hipify() operates on the
+    # whole cuda_src/ directory (src_files[0].parent -- same directory for
+    # every file in src_files, single- or multi-file alike), discovering
+    # every .cu/.cpp/.cuh/.h/.hpp in it itself -- see that function's
+    # docstring for how it treats headers vs. translation units.
     _advance(job, JobPhase.PORTING, ws)
     hip_out = ws_dir / "hip_out"
     _append_message(job, "HIP Porting Specialist", "action", "Running hipify (auto-selecting hipify-perl or hipify-clang) on CUDA sources.")
-    ok, log, err, hipify_tool = run_hipify(src_cu.parent, hip_out, job.job_id)
-    job.hipify_command = f"{hipify_tool} ..."
+    ok, log, err, hipify_tool = run_hipify(src_files[0].parent, hip_out, job.job_id, extra_perl_args=hipify_extra_args)
+    job.hipify_command = f"{hipify_tool} {' '.join(hipify_extra_args)} ...".strip()
     (ws_dir / "logs" / "hipify.log").write_text(log, encoding="utf-8")
 
     if not ok and not MOCK:
@@ -495,10 +552,11 @@ def run_baseline(
     # doesn't match what was compiled for.
     binary = hip_out / f"{job.seed_id.value}_hip"
     _append_message(job, "HIP Porting Specialist", "action", "Compiling with hipcc -O3 (auto-detecting target GPU architecture).")
-    ok, log, err, arch_used = run_hipcc(hip_files, binary)
+    ok, log, err, arch_used = run_hipcc(hip_files, binary, extra_link_flags=hipcc_link_flags)
     (ws_dir / "logs" / "hipcc.log").write_text(log, encoding="utf-8")
     job.gpu_arch = arch_used
-    job.hipcc_command = f"hipcc -O3 --offload-arch={arch_used} ... -o {binary.name}"
+    link_flags_suffix = f" {' '.join(hipcc_link_flags)}" if hipcc_link_flags else ""
+    job.hipcc_command = f"hipcc -O3 --offload-arch={arch_used} ... -o {binary.name}{link_flags_suffix}"
 
     # run_hipcc() already returns a bool (success = rc == 0 computed inside
     # it) — do NOT compare it to 0 again. `False == 0` is True in Python
@@ -569,6 +627,30 @@ def run_baseline(
         (ws_dir / "logs" / "amd_smi_post.txt").write_text(post_raw, encoding="utf-8")
 
         parsed = parse_binary_output_for_metrics(stdout)
+
+        # Rich fallback for an unrecognized output format: parsed comes
+        # back completely empty only when NONE of parse_binary_output_
+        # for_metrics()'s known regexes matched anything (not "some
+        # fields missing" — that's the normal case for e.g. reduction,
+        # which has no achieved-bandwidth self-report line on purpose).
+        # A binary that prints real, meaningful output SATO SWARM simply
+        # doesn't have a parser for yet must not be reported as a bare,
+        # context-free "Not captured" everywhere — that reads as "nothing
+        # happened" when something clearly did. The raw text itself
+        # (never reformatted/guessed-at) is surfaced directly in the
+        # report (see generate_minimal_report()) instead of only being
+        # reachable by separately opening logs/run.log.
+        if not parsed and stdout.strip():
+            snippet = stdout.strip()
+            if len(snippet) > 2000:
+                snippet = snippet[:2000] + f"\n... [truncated, {len(stdout.strip())} bytes total — see logs/run.log for the complete text]"
+            job.unrecognized_output_snippet = snippet
+            _append_message(
+                job, "Benchmark & Profiler", "observation",
+                f"Binary produced output but it matched none of this pipeline's known metric/validation formats "
+                f"(no 'Kernel time:' line, no recognized actual-vs-expected check line). Raw stdout captured "
+                f"verbatim below and in logs/run.log rather than shown as a context-free 'Not captured'.",
+            )
 
         # Raw GPU telemetry: use exactly what was actually captured for this
         # run (the post-kernel snapshot). No `or <constant>` fallback here —
@@ -722,12 +804,26 @@ def generate_minimal_report(job: JobState, ws_dir: Path, run_stdout: str) -> Pat
             f"hipcc returned an error (see logs/hipcc.log and the error field). "
             f"Diagnostic report + attempted ported sources + full logs are included in the artifacts tar."
         )
-    elif d.kernel_time_ms is None or achieved is None:
+    elif d.kernel_time_ms is None:
         exec_summary = (
             f"Baseline (non-agent) port of {job.seed_id.value} compiled and ran, but the binary's "
-            f"stdout did not contain a parseable timing/metric line — kernel_time_ms and the achieved "
-            f"metric are both \"Not captured\" below rather than a guessed number. See logs/run.log "
-            f"for the raw stdout."
+            f"stdout did not contain a parseable \"Kernel time:\" line — kernel_time_ms and the "
+            f"achieved metric are both \"Not captured\" below rather than a guessed number. See "
+            f"logs/run.log for the raw stdout."
+        )
+    elif achieved is None:
+        # kernel_time_ms IS real here — this is NOT the same "nothing was
+        # captured" situation as the branch above, and must not share its
+        # wording (a seed with no achieved-bandwidth/TFLOPS branch in
+        # _compute_derived_metrics() — see that function — still has a
+        # completely real, measured kernel time; saying "did not contain a
+        # parseable timing line" here would directly contradict the real
+        # Kernel time value the table below this summary shows).
+        exec_summary = (
+            f"Baseline (non-agent) port of {job.seed_id.value} completed in "
+            f"{_fmt(round(d.kernel_time_ms, 3), ' ms')}. No achieved bandwidth/TFLOPS is computed for "
+            f"this seed (see logs/run.log for the binary's full raw stdout) — \"Not applicable\" below "
+            f"rather than a guessed number."
         )
     else:
         exec_summary = (
@@ -735,6 +831,58 @@ def generate_minimal_report(job: JobState, ws_dir: Path, run_stdout: str) -> Pat
             f"Achieved {_fmt(achieved)}"
             + (f" ({eff}% of theoretical {peak_note})." if eff is not None else f" (efficiency % of theoretical {peak_note} not applicable for this seed).")
         )
+
+    # Only rendered when at least one of the 4 known CUDA library headers
+    # (cublas_v2.h/cudnn.h/thrust/*/nccl.h) was actually found in source —
+    # see src/tools/execution.py's detect_cuda_library_includes(). Empty
+    # string (section omitted entirely) for every job that references
+    # none of them, which is every one of the 4 original seeds plus
+    # multiFileDemo.
+    # Only rendered when the binary's stdout matched none of parse_binary_
+    # output_for_metrics()'s known formats (see run_baseline() for where
+    # job.unrecognized_output_snippet is set) — None for every one of the
+    # 4 original seeds + multiFileDemo, whose output is always recognized.
+    unrecognized_output_section = ""
+    if job.unrecognized_output_snippet:
+        unrecognized_output_section = f"""
+## Raw Binary Output (unrecognized format)
+
+This binary's stdout didn't match any of this pipeline's known metric or
+validation formats (see `parse_binary_output_for_metrics()` in
+`src/tools/execution.py`) — every "Not captured" above reflects that, not a
+crash or missing run. Verbatim output (identical copy also in
+`logs/run.log`):
+
+```
+{job.unrecognized_output_snippet}
+```
+"""
+
+    library_section = ""
+    if job.library_detections:
+        def _library_row(d: dict) -> str:
+            rocm_header_cell = f"`{d['rocm_header']}`" if d.get("rocm_header") else "no rewrite needed"
+            return (
+                f"| {d['rocm_name']} | `{d['cuda_header']}` | {rocm_header_cell} | "
+                f"{d.get('link_flag') or 'none (header-only)'} | "
+                f"{'Yes' if d['available'] else 'No'} ({d['availability_detail']}) |"
+            )
+        rows = "\n".join(_library_row(d) for d in job.library_detections)
+        caveats = "\n".join(
+            f"- **{d['rocm_name']}**: {d['caveat']}" for d in job.library_detections if d.get("caveat")
+        )
+        library_section = f"""
+## CUDA Library Dependencies
+
+| ROCm library | CUDA header found | ROCm header | hipcc link flag | Installed on this machine |
+|---|---|---|---|---|
+{rows}
+
+"Installed on this machine" is a real filesystem check against this machine's
+/opt/rocm (never assumed present just because the header was referenced) —
+{"skipped in MOCK mode, see the detail column" if MOCK else "see the detail column for exactly what was checked"}.
+{caveats}
+"""
 
     content = f"""# SATO SWARM Migration Report — {job.seed_id.value}
 
@@ -770,7 +918,7 @@ def generate_minimal_report(job: JobState, ws_dir: Path, run_stdout: str) -> Pat
 *Computed live from this GPU's actual rocminfo/amd-smi output every run — no hardcoded per-SKU table. Full raw query trace: logs/gpu_specs.log.*
 
 **Key takeaway**: {"COMPILE/PORT FAILED on this run — see the Migration Notes section + logs/ for details. All attempted sources and logs are in the tar." if is_failed else ("Kernel time is the seed's own hipEventElapsedTime() measurement — real GPU-side timing recorded directly around the kernel launch. Bandwidth/TFLOPS are computed in Python from that real time plus a real byte/FLOP count also parsed from the binary's own stdout — never a constant. Power/utilization/temperature come from amd-smi; any 'Not captured' means the amd-smi JSON parser did not recognize a field on this instance — the raw amd-smi text is still saved in logs/amd_smi_pre.txt and logs/amd_smi_post.txt for manual reading." if not MOCK else "MOCK mode — every number on this page is simulated (tagged (SIMULATED) above), not measured. Run with SATOSWARM_MOCK unset (or =0) on a real AMD GPU for measured numbers — the target architecture is auto-detected, no config needed.")}
-
+{unrecognized_output_section}
 ## Migration Notes & Limitations
 This baseline performs a direct hipify + compile + benchmark, once, with no repair loop. On real hardware:
 
@@ -781,7 +929,7 @@ This baseline performs a direct hipify + compile + benchmark, once, with no repa
 - Power/utilization are single pre/post snapshots, not continuous sampling during the kernel — "peak" power reuses the one real post-run reading rather than inventing a distinct number.
 - If the binary's own self-printed "Achieved ..." line disagrees with the Python-computed value by more than 1%, a warning message is logged (see the job's message trace) and the Python-computed value is used as the report's headline number.
 - Theoretical peak bandwidth/TFLOPS are computed live from this GPU's own rocminfo (compute units, max engine clock) + amd-smi (max memory clock, memory bus width) output — see detect_gpu_theoretical_peaks() in src/tools/execution.py. If either tool doesn't expose the fields this needs on this ROCm version, that side falls back to a small verified-spec-sheet table (currently just MI300X/gfx942), and to "Not applicable" if even that has no entry — never a guessed or borrowed-from-another-GPU number. logs/gpu_specs.log has the full raw query trace either way.
-
+{library_section}
 ## Generated Artifacts
 - Ported HIP sources + binary: hip_out/
 - Full migration_report.md (this file)

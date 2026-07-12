@@ -42,6 +42,13 @@ class SeedId(str, Enum):
     # WorkspaceManager.copy_seed() finds seeds/repairDemo.cu without
     # needing an entry in that method's fallback mapping dict.
     REPAIR_DEMO = "repairDemo"
+    # Synthetic multi-file project fixture — seeds/multiFileDemo/ is a
+    # DIRECTORY, not a single .cu file (main.cu calls into helper.cu via
+    # helper.cuh). Exercises WorkspaceManager.copy_seed()'s directory-copy
+    # path and run_hipify()/run_hipcc()'s existing multi-source handling
+    # end to end. Not a benchmark seed — see seeds/multiFileDemo/main.cu's
+    # header comment.
+    MULTI_FILE_DEMO = "multiFileDemo"
 
 
 class AgentMessage(BaseModel):
@@ -165,10 +172,31 @@ class JobState(BaseModel):
     gpu_arch: Optional[str] = None
     repair_loops: int = 0
 
+    # CUDA library #includes detected in source (cublas_v2.h/cudnn.h/
+    # thrust/*/nccl.h — see src/tools/execution.py's
+    # detect_cuda_library_includes()) and their real ROCm equivalents.
+    # Empty for every job that doesn't reference any of the 4 — which is
+    # every one of the 4 original seeds. One dict per detected library:
+    # {cuda_header, rocm_name, rocm_header, link_flag, available,
+    # availability_detail, caveat} — all JSON-primitive fields, no nested
+    # models, since this is a report-facing fact list, not something
+    # anything else in the pipeline branches on.
+    library_detections: list[dict[str, Any]] = Field(default_factory=list)
+
     # Validation
     validation_passed: Optional[bool] = None
     max_abs_diff: Optional[float] = None
     tolerance: float = 1e-5
+
+    # Populated ONLY when the binary printed something to stdout but
+    # src/tools/execution.py's parse_binary_output_for_metrics() matched
+    # NONE of its known formats (empty dict back) — see
+    # src/baseline/pipeline.py's run_baseline() for where this is set.
+    # None for every one of the 4 original seeds + multiFileDemo, whose
+    # output is always recognized. Exists so a report reader sees the
+    # actual unrecognized text directly instead of a bare "Not captured"
+    # with no further context prompting a trip to logs/run.log.
+    unrecognized_output_snippet: Optional[str] = None
 
     error: Optional[str] = None
 

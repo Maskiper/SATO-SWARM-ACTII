@@ -110,8 +110,19 @@ def _cuda_sdk_present() -> bool:
     )
 
 
-def run_hipify(source_dir: Path, out_dir: Path, job_id: str) -> tuple[bool, str, str, str]:
+def run_hipify(
+    source_dir: Path, out_dir: Path, job_id: str, extra_perl_args: Optional[list[str]] = None
+) -> tuple[bool, str, str, str]:
     """Translate the .cu files in source_dir to HIP.
+
+    extra_perl_args: additional flags inserted into the hipify-perl
+    command line ONLY — never applied to a hipify-clang fallback
+    invocation, since hipify-clang is a different binary with its own
+    unresearched flag set (this project has only verified hipify-perl's
+    flags — see detect_cuda_library_includes()'s docstring in this same
+    module for the one flag currently passed this way, `--roc`, and why).
+    None/empty by default, so every existing caller's hipify-perl command
+    line is completely unchanged.
 
     Prefers hipify-perl: pure text/regex substitution, needs no CUDA SDK
     at all — the correct default on an AMD-only box. hipify-clang is only
@@ -124,9 +135,22 @@ def run_hipify(source_dir: Path, out_dir: Path, job_id: str) -> tuple[bool, str,
     it takes ONE .cu file and prints the translated HIP source to stdout
     (no --cuda-path, no -o <dir> batch mode) — so each source file is
     hipified individually here, with stdout captured and written to
-    <stem>.hip.cpp in out_dir ourselves. Diagnostics/warnings from
-    hipify-perl go to stderr (stdout is a clean redirectable source
-    stream), which is what's captured in the returned log.
+    out_dir ourselves. Diagnostics/warnings from hipify-perl go to stderr
+    (stdout is a clean redirectable source stream), which is what's
+    captured in the returned log.
+
+    Output naming: a translation unit (.cu/.cpp) becomes
+    <stem>.hip.cpp — the stable convention _discover_hip_sources() (see
+    src/baseline/pipeline.py) globs for. A HEADER (.cuh/.h/.hpp) instead
+    keeps its ORIGINAL filename unchanged (just hipified content) —
+    hipify has no way to know this pipeline is about to relocate/rename
+    anything, so it never rewrites a `#include "helper.cuh"` line in a
+    sibling file to point at a new name; preserving the header's own name
+    in out_dir is what keeps that #include resolving after hipify runs.
+    This also means _discover_hip_sources() correctly leaves headers out
+    of the hipcc compile-file list (its glob patterns are *.hip.cpp/
+    *.cpp/*.cu only, never *.cuh/*.h/*.hpp) — headers are #included by a
+    compiled source, never compiled as their own translation unit.
 
     Returns (success, log, stderr, tool_used) — tool_used is whichever
     binary name was actually invoked, so the caller can record it rather
@@ -134,9 +158,13 @@ def run_hipify(source_dir: Path, out_dir: Path, job_id: str) -> tuple[bool, str,
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    cu_files = list(source_dir.glob("*.cu")) + list(source_dir.glob("*.cuh"))
+    cu_files = (
+        list(source_dir.glob("*.cu")) + list(source_dir.glob("*.cpp"))
+        + list(source_dir.glob("*.cuh")) + list(source_dir.glob("*.h"))
+        + list(source_dir.glob("*.hpp"))
+    )
     if not cu_files:
-        return False, "", "No .cu files found to hipify", "n/a (no sources)"
+        return False, "", "No .cu/.cpp/.cuh/.h/.hpp files found to hipify", "n/a (no sources)"
 
     use_clang = False
     if not MOCK:
@@ -148,9 +176,10 @@ def run_hipify(source_dir: Path, out_dir: Path, job_id: str) -> tuple[bool, str,
     logs: list[str] = []
     overall_success = True
     last_stderr = ""
+    is_header = {".cuh", ".h", ".hpp"}
 
     for f in cu_files:
-        out_file = out_dir / f"{f.stem}.hip.cpp"
+        out_file = out_dir / (f.name if f.suffix in is_header else f"{f.stem}.hip.cpp")
 
         if use_clang:
             cmd = ["hipify-clang", "--cuda-path=/usr/local/cuda", "-o", str(out_file), str(f)]
@@ -158,7 +187,7 @@ def run_hipify(source_dir: Path, out_dir: Path, job_id: str) -> tuple[bool, str,
             success = rc == 0
             logs.append(f"$ {' '.join(cmd)}\n{stdout}\n{stderr}")
         else:
-            cmd = ["hipify-perl", str(f)]
+            cmd = ["hipify-perl", *(extra_perl_args or []), str(f)]
             rc, stdout, stderr = _run(cmd, cwd=source_dir, timeout=30)
             success = rc == 0
             if success and not MOCK:
@@ -172,7 +201,7 @@ def run_hipify(source_dir: Path, out_dir: Path, job_id: str) -> tuple[bool, str,
 
     if overall_success and MOCK:
         for f in cu_files:
-            placeholder = out_dir / f"{f.stem}.hip.cpp"
+            placeholder = out_dir / (f.name if f.suffix in is_header else f"{f.stem}.hip.cpp")
             if not placeholder.exists():
                 placeholder.write_text(f"// [MOCK] simulated hipify output for {f.name}\n", encoding="utf-8")
 
@@ -241,7 +270,12 @@ def detect_gpu_arch() -> Optional[str]:
     return None
 
 
-def run_hipcc(hip_sources: list[Path], out_binary: Path, arch: Optional[str] = None) -> tuple[bool, str, str, str]:
+def run_hipcc(
+    hip_sources: list[Path],
+    out_binary: Path,
+    arch: Optional[str] = None,
+    extra_link_flags: Optional[list[str]] = None,
+) -> tuple[bool, str, str, str]:
     """Compile with hipcc, targeting the GPU actually present.
 
     If `arch` isn't given explicitly, auto-detects it via
@@ -250,6 +284,14 @@ def run_hipcc(hip_sources: list[Path], out_binary: Path, arch: Optional[str] = N
     machine's GPU at compile time) rather than assuming any specific
     architecture — compiling for the wrong one doesn't fail the build, it
     produces a binary that segfaults on launch.
+
+    extra_link_flags: additional flags appended AFTER the source files
+    (hipcc, like any clang/gcc-family driver, wants -l<lib> after the
+    objects/sources that reference it) — see
+    detect_cuda_library_includes() for where these come from (a real
+    CUDA library #include found in source, e.g. `-lrocblas` for
+    `#include <cublas_v2.h>`). None/empty by default, so every existing
+    caller's hipcc command line is completely unchanged.
 
     Returns (success, log, stderr, arch_used) — arch_used is whatever was
     actually passed to --offload-arch=, so the caller can log it and
@@ -266,11 +308,225 @@ def run_hipcc(hip_sources: list[Path], out_binary: Path, arch: Optional[str] = N
     cmd = ["hipcc", "-O3", f"--offload-arch={arch}"]
     cmd += [str(p) for p in hip_sources]
     cmd += ["-o", str(out_binary)]
+    cmd += list(extra_link_flags or [])
 
     rc, stdout, stderr = _run(cmd, timeout=180)
     success = rc == 0
     log = f"$ {' '.join(cmd)}\n{stdout}\n{stderr}"
     return success, log, stderr, arch
+
+
+# ---------------------------------------------------------------------------
+# CUDA library detection -> real ROCm equivalent + hipcc link flags.
+#
+# Covers exactly the 4 headers this was scoped to (cublas_v2.h, cudnn.h,
+# thrust/*, nccl.h) — deliberately not silently expanded to cuRAND/
+# cuSPARSE/cuSOLVER/etc, which hipify-perl's own --roc flag DOES also
+# handle (see bin/hipify-perl's rocIncludes(), amd-develop branch) but
+# this project has not independently verified link-flag/.so-name
+# evidence for the way it has for the 4 below — left unhandled rather
+# than extending the table on an assumption.
+#
+# Every mapping below was confirmed against real, current upstream
+# source, not inferred from naming convention — see each entry's
+# "source" field for exactly what was checked and where:
+#   - cublas_v2.h / cudnn.h: hipify-perl's own rocIncludes()/
+#     MIOpenIncludes() functions (bin/hipify-perl, amd-develop branch) —
+#     these only run when hipify-perl is invoked with --roc (or, for
+#     cudnn.h alone, --miopen); the tool's own default behavior with NO
+#     flags maps these to hipBLAS/hipDNN instead (simpleIncludes(), which
+#     always runs) — SATO SWARM deliberately requests the --roc mapping
+#     (see detect_cuda_library_includes()'s docstring) because rocBLAS/
+#     MIOpen are the actual native ROCm libraries, not a portability
+#     shim. .so names confirmed via rocBLAS's/MIOpen's own real
+#     CMakeLists.txt (library target names), github.com/ROCm/rocBLAS and
+#     github.com/ROCm/MIOpen, develop branches.
+#   - thrust/* / nccl.h: hipify-perl has ZERO mapping for either
+#     (confirmed by direct search of the real bin/hipify-perl source —
+#     no match for "thrust" or "nccl" anywhere in the file) — these two
+#     mappings are SATO SWARM's own, confirmed instead against the real
+#     ROCm/rocThrust and ROCm/rccl repositories directly (see each
+#     entry's "source" field).
+# ---------------------------------------------------------------------------
+_CUDA_LIBRARY_MAPPINGS: dict[str, dict[str, Any]] = {
+    "cublas_v2.h": {
+        "rocm_name": "rocBLAS",
+        "rocm_header": "rocblas.h",
+        "link_flag": "-lrocblas",
+        "so_glob": "librocblas.so*",
+        "header_only": False,
+        "header_check_subdir": None,
+        "caveat": None,
+        "source": (
+            "bin/hipify-perl:1885 (rocIncludes(), fires with --roc), "
+            "github.com/ROCm/HIPIFY amd-develop branch. librocblas.so "
+            "confirmed via rocBLAS's own library/CMakeLists.txt "
+            "(rocblas_SOVERSION), github.com/ROCm/rocBLAS develop branch."
+        ),
+    },
+    "cudnn.h": {
+        "rocm_name": "MIOpen",
+        "rocm_header": "miopen/miopen.h",
+        "link_flag": "-lMIOpen",
+        "so_glob": "libMIOpen.so*",
+        "header_only": False,
+        "header_check_subdir": None,
+        "caveat": (
+            "PARTIAL translation only. hipify-perl's own --miopen help text reads "
+            "'Translate cuDNN to MIOpen instead of hipDNN where it is possible' "
+            "(bin/hipify-perl:45,81) -- and 789 distinct cuDNN identifiers are "
+            "explicitly listed as unsupported for MIOpen translation "
+            "(hash_MIOpenOnlyUnsupportedFunctions, bin/hipify-perl:8389-9180). MIOpen's "
+            "API does not mirror cuDNN's (different descriptor/dispatch model) -- only "
+            "this #include line is guaranteed to translate mechanically; actual cudnn* "
+            "API calls in the body need real, manual porting work, not a mechanical swap."
+        ),
+        "source": (
+            "bin/hipify-perl:1886 (rocIncludes()) and :1915 (MIOpenIncludes()), both "
+            "fire with --roc/--miopen, github.com/ROCm/HIPIFY amd-develop branch. "
+            "libMIOpen.so confirmed via MIOpen's own src/CMakeLists.txt (target name "
+            "'MIOpen'), github.com/ROCm/MIOpen develop branch."
+        ),
+    },
+    "nccl.h": {
+        "rocm_name": "RCCL",
+        "rocm_header": "rccl/rccl.h",
+        "link_flag": "-lrccl",
+        "so_glob": "librccl.so*",
+        "header_only": False,
+        "header_check_subdir": None,
+        "caveat": None,
+        "source": (
+            "RCCL's own CMakeLists.txt lines 516-517 ('configure_file(src/nccl.h.in "
+            "${PROJECT_BINARY_DIR}/include/rccl/rccl.h)  # For external linking') and "
+            "line 1478 (install DESTINATION .../rccl), github.com/ROCm/rccl develop "
+            "branch. librccl.so confirmed via RCCL's own README.md. hipify-perl has NO "
+            "mapping for nccl.h at all (confirmed: zero matches for 'nccl' anywhere in "
+            "bin/hipify-perl) -- this rewrite is SATO SWARM's own, not hipify-perl's."
+        ),
+    },
+    "thrust/": {
+        "rocm_name": "rocThrust",
+        "rocm_header": None,  # no rewrite needed -- see "source" below
+        "link_flag": None,     # header-only -- no link flag
+        "so_glob": None,
+        "header_only": True,
+        "header_check_subdir": "thrust",
+        "caveat": None,
+        "source": (
+            "ROCm/rocThrust's real repository (github.com/ROCm/rocThrust) mirrors CUDA "
+            "Thrust's thrust/ include tree exactly, file for file (confirmed via direct "
+            "GitHub API directory listing of its top-level thrust/ folder) -- "
+            "#include <thrust/...> needs NO rewrite, only rocThrust (+ its rocPRIM "
+            "dependency) actually being installed and on the include path. Header-only, "
+            "like upstream CUDA Thrust -- confirmed via rocThrust's own README (no "
+            "library target to link against) -- so no link flag either. hipify-perl has "
+            "NO mapping for thrust/* at all (confirmed: zero matches for 'thrust' "
+            "anywhere in bin/hipify-perl)."
+        ),
+    },
+}
+
+_INCLUDE_RE = re.compile(r'#\s*include\s*[<"]([^>"]+)[>"]')
+
+
+def detect_cuda_library_includes(source_dir: Path) -> list[dict[str, Any]]:
+    """Scan every .cu/.cpp/.cuh/.h/.hpp file directly inside source_dir
+    (non-recursive — matches run_hipify()'s own file discovery) for an
+    #include referencing one of the 4 CUDA library headers this project
+    has verified real ROCm mappings for — see _CUDA_LIBRARY_MAPPINGS'
+    module comment for exactly what's covered and why not more.
+
+    Returns one dict per DISTINCT library actually found (never one for
+    all 4 unconditionally, and never duplicated across multiple
+    #includes/multiple files) — each a copy of its _CUDA_LIBRARY_MAPPINGS
+    entry plus "matched_headers" (the exact #include text(s) seen, e.g.
+    "thrust/device_vector.h") and "found_in" (which file name(s) it
+    appeared in), both sorted lists for deterministic output. Empty list
+    means none of the 4 were referenced — the normal case for the 4
+    original seeds, which reference none of them.
+    """
+    found: dict[str, dict[str, Any]] = {}
+
+    src_files = (
+        list(source_dir.glob("*.cu")) + list(source_dir.glob("*.cpp"))
+        + list(source_dir.glob("*.cuh")) + list(source_dir.glob("*.h"))
+        + list(source_dir.glob("*.hpp"))
+    )
+    for f in src_files:
+        try:
+            text = f.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for m in _INCLUDE_RE.finditer(text):
+            header = m.group(1)
+            if header in _CUDA_LIBRARY_MAPPINGS:
+                key = header
+            elif header.startswith("thrust/"):
+                key = "thrust/"
+            else:
+                continue
+            entry = found.setdefault(key, dict(_CUDA_LIBRARY_MAPPINGS[key]))
+            entry.setdefault("matched_headers", set()).add(header)
+            entry.setdefault("found_in", set()).add(f.name)
+
+    result = []
+    for key, entry in found.items():
+        entry = dict(entry)
+        entry["cuda_header"] = key
+        entry["matched_headers"] = sorted(entry.get("matched_headers", ()))
+        entry["found_in"] = sorted(entry.get("found_in", ()))
+        result.append(entry)
+    return sorted(result, key=lambda e: e["cuda_header"])
+
+
+def check_rocm_library_available(entry: dict[str, Any]) -> tuple[bool, str]:
+    """Honest, real check for whether a detected ROCm library is actually
+    installed on THIS machine — never assumed present just because it was
+    referenced in source. Checks the standard ROCm install prefix
+    (/opt/rocm — same convention as _cuda_sdk_present()'s CUDA-SDK check
+    and scripts/preflight.sh's toolchain checks elsewhere in this
+    project), not just whether a compiler happens to accept the flag.
+
+    In MOCK mode: never touches the filesystem, matching every other
+    function in this file (see the MOCK flag docstring at the top) — the
+    real installed-or-not state of a machine this pipeline isn't actually
+    running commands against would be meaningless to report, so this
+    returns an explicit "not checked" rather than a fabricated True/False
+    that could be mistaken for a real finding.
+
+    Header-only libraries (rocThrust — see entry["header_only"]) are
+    checked by include-subdirectory presence; linked libraries by .so
+    presence via glob (ROCm shared objects are typically versioned, e.g.
+    librocblas.so.4.x.x — a bare-filename exists() check would miss a
+    real, present install).
+    """
+    if MOCK:
+        return False, "MOCK mode — library availability not checked (no real filesystem/toolchain query in mock mode)"
+
+    rocm_root = Path("/opt/rocm")
+
+    if entry.get("header_only"):
+        subdir = entry.get("header_check_subdir")
+        path = rocm_root / "include" / subdir
+        try:
+            present = path.is_dir() and any(path.iterdir())
+        except OSError:
+            present = False
+        return present, f"checked {path} — {'found' if present else 'not found'}"
+
+    so_glob = entry.get("so_glob")
+    if not so_glob:
+        return False, "no .so name known to check for this library"
+    try:
+        matches = sorted(p.name for p in (rocm_root / "lib").glob(so_glob))
+    except OSError:
+        matches = []
+    present = bool(matches)
+    detail = f"checked {rocm_root / 'lib'}/{so_glob} — " + (
+        f"found: {', '.join(matches)}" if present else "not found"
+    )
+    return present, detail
 
 
 def _try_float(value: Any) -> Optional[float]:
@@ -1086,6 +1342,8 @@ def run_binary(binary: Path, args: list[str], timeout: int = 120) -> tuple[int, 
             stdout = _mock_seed_output("tiledMatmul")
         elif "reduction" in name or "reduce" in name:
             stdout = _mock_seed_output("reduction")
+        elif "multifiledemo" in name:
+            stdout = _mock_seed_output("multiFileDemo")
         else:
             stdout = "seed completed successfully.\nKernel time: 1.23 ms\n"
         rc, stderr = 0, ""
@@ -1132,6 +1390,14 @@ def _mock_seed_output(seed_name: str) -> str:
             "Kernel time: 0.418 ms\n"
             "Effective read BW: 2568.76 GB/s\n"
             "reduction seed completed.\n"
+        )
+    elif seed_name == "multiFileDemo":
+        return (
+            "SATO SWARM multiFileDemo seed\n"
+            "Result check: c[0]=0.0000 (exp 0.0000), c[n-1]=1.8750 (exp 1.8750)\n"
+            "\n=== multiFileDemo Timing ===\n"
+            "Kernel time: 0.512 ms\n"
+            "multiFileDemo seed completed successfully.\n"
         )
     return "seed completed successfully.\n"
 

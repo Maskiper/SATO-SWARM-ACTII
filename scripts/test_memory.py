@@ -47,7 +47,7 @@ def main() -> None:
     print(f"Loaded {len(memory)} patterns")
     print()
 
-    check("loaded exactly the 4 seeded patterns", len(memory) == 4, f"got {len(memory)}")
+    check("loaded exactly the 7 seeded patterns", len(memory) == 7, f"got {len(memory)}")
     print()
 
     # --- realistic hipcc-style error quoting the verified repairDemo gap ---
@@ -132,13 +132,15 @@ def main() -> None:
     print(context)
     print()
     check("get_context_for_agent returns non-empty readable text", len(context) > 100)
-    check("context mentions all 4 seeded pattern cuda fields", all(
+    check("context mentions all 7 seeded pattern cuda fields", all(
         p["cuda"].split()[0] in context for p in [
             {"cuda": "cudaFuncGetName"}, {"cuda": "cudaGraphConditionalHandleCreate"},
             {"cuda": "cudaDeviceFlushGPUDirectRDMAWrites"}, {"cuda": "cudaCtxResetPersistingL2Cache"},
+            {"cuda": "cudaInitDevice"}, {"cuda": "cudaEventElapsedTime_v2"},
+            {"cuda": "cudaOccupancyMaxActiveClusters"},
         ]
     ))
-    check("cleaned up test-only persisted line, file back to 4 patterns", len(fresh) == 4, f"got {len(fresh)}")
+    check("cleaned up test-only persisted line, file back to 7 patterns", len(fresh) == 7, f"got {len(fresh)}")
     print()
 
     print("=" * 70)

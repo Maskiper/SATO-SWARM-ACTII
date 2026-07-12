@@ -264,7 +264,7 @@ def main() -> None:
     removed = len(lines) - len(clean_lines)
     MEMORY_PATH.write_text("\n".join(clean_lines) + "\n", encoding="utf-8")
     check(f"cleaned up the {removed} test-confirmed pattern from memory/porting_patterns.jsonl", removed == 1)
-    check("memory file back to exactly the 4 curated patterns", len(PortingMemory(path=MEMORY_PATH)) == 4)
+    check("memory file back to exactly the 7 curated patterns", len(PortingMemory(path=MEMORY_PATH)) == 7)
     print()
 
     # =====================================================================
@@ -272,10 +272,10 @@ def main() -> None:
     print("TEST B — wired through the REAL, unmodified run_baseline()")
     print("=" * 70)
 
-    def fake_first_attempt_run_hipcc(hip_sources, out_binary, arch=None):
+    def fake_first_attempt_run_hipcc(hip_sources, out_binary, arch=None, extra_link_flags=None):
         return False, SIMULATED_HIPCC_ERROR, "1 error generated.", "gfx1100"
 
-    def fake_run_hipify_with_real_content(source_dir, out_dir, job_id):
+    def fake_run_hipify_with_real_content(source_dir, out_dir, job_id, extra_perl_args=None):
         # MOCK-mode's real run_hipify() only writes a one-line placeholder
         # (see execution.py) — no gap line for the repair loop to find.
         # This monkeypatch is ONLY about getting genuine translated
@@ -335,7 +335,7 @@ def main() -> None:
     removed_b = len(lines) - len(clean_lines)
     MEMORY_PATH.write_text("\n".join(clean_lines) + "\n", encoding="utf-8")
     check(f"cleaned up TEST B's {removed_b} test-confirmed pattern too", removed_b == 1)
-    check("memory file still back to exactly the 4 curated patterns", len(PortingMemory(path=MEMORY_PATH)) == 4)
+    check("memory file still back to exactly the 7 curated patterns", len(PortingMemory(path=MEMORY_PATH)) == 7)
     print()
 
     # =====================================================================
