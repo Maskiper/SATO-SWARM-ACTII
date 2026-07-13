@@ -99,6 +99,11 @@ class JobCreateResponse(BaseModel):
     status: str
 
 
+class AdminCleanupResponse(BaseModel):
+    cleaned: int
+    skipped_replay_jobs: int
+
+
 def _report_path(job_id: str) -> Path:
     return WS.get_workspace(job_id) / "reports" / "migration_report.md"
 
@@ -241,6 +246,36 @@ def demo_replay(
     report_md = report_path.read_text(encoding="utf-8") if report_path.exists() else None
 
     return JSONResponse({"job": json.loads(job.model_dump_json()), "report_md": report_md})
+
+
+@app.post("/admin/cleanup", response_model=AdminCleanupResponse)
+def admin_cleanup(
+    max_age_hours: int = Query(24, description="Delete job directories under jobs/ older than this many hours"),
+) -> AdminCleanupResponse:
+    """Deletes job directories under jobs/ older than max_age_hours
+    (default 24 — one day; chosen to match WorkspaceManager.cleanup_old_
+    jobs()'s pre-existing default rather than invent a new number).
+
+    NEVER deletes the 4 real captured job directories /demo/replay
+    depends on (REPLAY_JOB_IDS' values) — passed explicitly as
+    protected_job_ids, skipped unconditionally regardless of age. This
+    matters concretely, not just in theory: those 4 real captures are,
+    as of this writing, already more than 24 hours old, so an
+    unprotected age sweep at the default setting would delete them on
+    its very first call.
+
+    Count-based truncation (WorkspaceManager.cleanup_old_jobs()'s
+    max_jobs) is deliberately NOT applied here — this endpoint's own
+    contract is age-only (the one parameter it exposes); silently also
+    deleting extra jobs by count would be a surprise side effect of an
+    age-scoped request.
+    """
+    cleaned, skipped_replay_jobs = WS.cleanup_old_jobs(
+        max_age_hours=max_age_hours,
+        max_jobs=None,
+        protected_job_ids=set(REPLAY_JOB_IDS.values()),
+    )
+    return AdminCleanupResponse(cleaned=cleaned, skipped_replay_jobs=skipped_replay_jobs)
 
 
 if __name__ == "__main__":

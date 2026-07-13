@@ -19,8 +19,11 @@ Usage:
     SATOSWARM_MOCK=1 python scripts/test_main.py
 """
 
+import os
 import re
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -28,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fastapi.testclient import TestClient
 
+import src.main as main_module
 from src.baseline.pipeline import run_baseline
 from src.main import app
 from src.models.job import JobState, SeedId
@@ -170,6 +174,135 @@ def main() -> None:
         received_ids == list(range(1, expected_count + 1)),
         f"got {received_ids}, expected 1..{expected_count}",
     )
+    print()
+
+    print("7. POST /admin/cleanup — deletes old jobs, NEVER deletes replay jobs")
+    print("   (fully isolated from the real jobs/ directory — a temp dir throughout)")
+
+    def make_fake_job_dir(base: Path, job_id: str, age_hours: float) -> Path:
+        d = base / job_id
+        (d / "reports").mkdir(parents=True, exist_ok=True)
+        (d / "state.json").write_text("{}", encoding="utf-8")
+        old_time = time.time() - age_hours * 3600
+        os.utime(d, (old_time, old_time))  # set LAST — creating children above bumps mtime
+        return d
+
+    real_replay_ids = set(main_module.REPLAY_JOB_IDS.values())
+    check("sanity: REPLAY_JOB_IDS has exactly 4 real job IDs", len(real_replay_ids) == 4, f"got {real_replay_ids}")
+
+    # --- 7a. Direct WorkspaceManager.cleanup_old_jobs() call.
+    #
+    # Proves CAUSATION, not just correlation: the SAME real-REPLAY_JOB_IDS
+    # -named directories, aged the SAME way (1000h, well past the 24h
+    # threshold), are run through cleanup_old_jobs() TWICE in the same
+    # temp dir — once WITHOUT protected_job_ids (must be deleted; this is
+    # what rules out a false positive from a broken aging mechanism, e.g.
+    # os.utime() silently not taking effect on this filesystem, which
+    # would make "survives" below pass vacuously without protection ever
+    # actually being exercised), then re-created and run again WITH
+    # protected_job_ids (must survive). The delta between these two runs
+    # in the same environment is the actual proof that protected_job_ids
+    # is the reason they survive the second time. ---
+    tmp_dir_a = Path(tempfile.mkdtemp(prefix="sato_cleanup_test_direct_"))
+    try:
+        tmp_ws_a = WorkspaceManager(base_dir=tmp_dir_a)
+
+        # -- control: same names, same age, NO protection — must die --
+        control_replay_dirs = [make_fake_job_dir(tmp_dir_a, jid, age_hours=1000) for jid in real_replay_ids]
+        cleaned_control, skipped_control = tmp_ws_a.cleanup_old_jobs(max_age_hours=24, max_jobs=None, protected_job_ids=None)
+        check(
+            "direct control: WITHOUT protection, all 4 real-replay-ID-named dirs (aged 1000h) ARE deleted",
+            cleaned_control == 4 and not any(d.exists() for d in control_replay_dirs),
+            f"cleaned={cleaned_control}, still exist={[str(d) for d in control_replay_dirs if d.exists()]}",
+        )
+        check("direct control: skipped_replay_jobs == 0 with no protected_job_ids given", skipped_control == 0, f"got {skipped_control}")
+
+        # -- now the actual protected scenario, same temp dir, same age --
+        old_normal_a = make_fake_job_dir(tmp_dir_a, "job_old_normal0000a1", age_hours=48)
+        recent_normal_a = make_fake_job_dir(tmp_dir_a, "job_recent_normal0a2", age_hours=1)
+        old_replay_dirs_a = [make_fake_job_dir(tmp_dir_a, jid, age_hours=1000) for jid in real_replay_ids]
+
+        cleaned_a, skipped_a = tmp_ws_a.cleanup_old_jobs(max_age_hours=24, max_jobs=None, protected_job_ids=real_replay_ids)
+        check("direct: exactly 1 non-replay old dir reported cleaned", cleaned_a == 1, f"got {cleaned_a}")
+        check("direct: skipped_replay_jobs == 4 (all real replay IDs present)", skipped_a == 4, f"got {skipped_a}")
+        check("direct: the old NON-replay dir is actually gone from disk", not old_normal_a.exists())
+        check("direct: the recent NON-replay dir is untouched", recent_normal_a.exists())
+        check(
+            "direct: the SAME real-replay-ID dirs deleted UNPROTECTED above now survive WITH protection — proves causation, not coincidence",
+            all(d.exists() for d in old_replay_dirs_a),
+            f"missing: {[str(d) for d in old_replay_dirs_a if not d.exists()]}",
+        )
+    finally:
+        shutil.rmtree(tmp_dir_a, ignore_errors=True)
+
+    # --- 7b. Wired through the REAL production endpoint — same causation
+    # proof as 7a (control run without protection, then the real
+    # protected run), but exercising POST /admin/cleanup itself, not just
+    # the WorkspaceManager method it delegates to. src.main.WS (a
+    # module-level singleton pointed at the real jobs/ dir — see
+    # src/main.py) is monkeypatched to this isolated temp dir for the
+    # duration of this block only, then restored — the real jobs/
+    # directory (which holds the actual REPLAY_JOB_IDS captures) is
+    # never touched or even opened by this test. The endpoint itself
+    # takes no protected_job_ids parameter (it always derives it from
+    # REPLAY_JOB_IDS server-side — see src/main.py's admin_cleanup()),
+    # so the control run instead temporarily empties main_module.
+    # REPLAY_JOB_IDS for that one call — the endpoint's own code is never
+    # modified, only the data it reads, restored immediately after. ---
+    tmp_dir_b = Path(tempfile.mkdtemp(prefix="sato_cleanup_test_endpoint_"))
+    original_ws = main_module.WS
+    try:
+        main_module.WS = WorkspaceManager(base_dir=tmp_dir_b)
+
+        # -- control: same real-replay-ID-named dirs, same age, but
+        # REPLAY_JOB_IDS temporarily empty -- the endpoint's own
+        # `protected_job_ids=set(REPLAY_JOB_IDS.values())` becomes an
+        # empty set for this one call, so they must be deleted --
+        control_replay_dirs_b = [make_fake_job_dir(tmp_dir_b, jid, age_hours=1000) for jid in real_replay_ids]
+        original_replay_ids = main_module.REPLAY_JOB_IDS
+        try:
+            main_module.REPLAY_JOB_IDS = {}
+            r_control = client.post("/admin/cleanup", params={"max_age_hours": 24})
+        finally:
+            main_module.REPLAY_JOB_IDS = original_replay_ids
+        check("endpoint control: returns 200 with REPLAY_JOB_IDS temporarily empty", r_control.status_code == 200, r_control.text)
+        body_control = r_control.json()
+        check(
+            "endpoint control: WITHOUT any protected IDs, all 4 real-replay-ID-named dirs (aged 1000h) ARE deleted",
+            body_control.get("cleaned") == 4 and not any(d.exists() for d in control_replay_dirs_b),
+            f"body={body_control}, still exist={[str(d) for d in control_replay_dirs_b if d.exists()]}",
+        )
+        check("endpoint control: skipped_replay_jobs == 0 with REPLAY_JOB_IDS empty", body_control.get("skipped_replay_jobs") == 0, f"got {body_control}")
+
+        # -- now the real production endpoint, REPLAY_JOB_IDS intact,
+        # same temp dir, same age --
+        old_normal_b = make_fake_job_dir(tmp_dir_b, "job_old_normal0000b1", age_hours=48)
+        recent_normal_b = make_fake_job_dir(tmp_dir_b, "job_recent_normal0b2", age_hours=1)
+        old_replay_dirs_b = [make_fake_job_dir(tmp_dir_b, jid, age_hours=1000) for jid in real_replay_ids]
+
+        r = client.post("/admin/cleanup", params={"max_age_hours": 24})
+        check("endpoint: returns 200", r.status_code == 200, r.text)
+        body = r.json()
+        check("endpoint: response has exactly {cleaned, skipped_replay_jobs}", set(body.keys()) == {"cleaned", "skipped_replay_jobs"}, f"got {body}")
+        check("endpoint: cleaned == 1", body.get("cleaned") == 1, f"got {body}")
+        check("endpoint: skipped_replay_jobs == 4", body.get("skipped_replay_jobs") == 4, f"got {body}")
+        check("endpoint: the old NON-replay dir is actually gone from disk", not old_normal_b.exists())
+        check("endpoint: the recent NON-replay dir is untouched", recent_normal_b.exists())
+        check(
+            "endpoint: the SAME real-replay-ID dirs deleted UNPROTECTED above now survive through the REAL production endpoint — proves causation, not coincidence",
+            all(d.exists() for d in old_replay_dirs_b),
+            f"missing: {[str(d) for d in old_replay_dirs_b if not d.exists()]}",
+        )
+    finally:
+        main_module.WS = original_ws
+        shutil.rmtree(tmp_dir_b, ignore_errors=True)
+
+    # --- 7c. Confirm the REAL jobs/ directory's actual replay captures
+    # were never touched by any of the above (belt-and-suspenders — 7a/7b
+    # never referenced the real WS/jobs dir at all, but this positively
+    # confirms it rather than just trusting the isolation held). ---
+    for jid in real_replay_ids:
+        check(f"real jobs/{jid}/ untouched by this test", (REPO_ROOT / "jobs" / jid).exists())
     print()
 
     # =========================================================================

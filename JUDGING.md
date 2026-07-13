@@ -1,4 +1,4 @@
-# SATO SWARM ports CUDA to AMD ROCm, runs it on real GPU hardware, and fixes its own compile failures — autonomously.
+**One-liner**: SATO SWARM ports CUDA to AMD ROCm, runs it on real GPU hardware, and fixes its own compile failures — autonomously.
 
 *SWARM = Swarm WorkForce Autonomous ReFActoring Migration*
 
@@ -86,7 +86,7 @@ A compile failure is still a **complete, inspectable run** — `run_baseline()` 
 - `reports/migration_report.md` — always generated, `**Final Status**: FAILED` clearly marked, with the exact `Executive Summary` explaining which step failed.
 - `reports/<job_id>_artifacts.tar.gz` — everything above, bundled, for offline inspection.
 
-## Reproducibility
+## Reproducibility & Honest Limitations
 
 ```bash
 git clone https://github.com/Maskiper/SATO-SWARM-ACTII.git
@@ -99,8 +99,6 @@ python scripts/test_baseline.py reduction
 python scripts/test_baseline.py repairDemo
 ```
 Full copy-paste sequence with exactly what to save as proof: **RUNBOOK.md**.
-
-## Honest limitations
 
 - **amd-smi's JSON schema varies by ROCm version.** It's already been wrong once and been fixed (three real structural bugs, see README.md's "amd-smi metric parsing" section) against real captured output from all 4 real job dirs — a different ROCm release could expose a field under a different key again. The raw `amd-smi` text is always saved regardless, so nothing is ever lost even when the parser misses a field.
 - **The GDDR6 bandwidth factor (`×17.8`) is empirically calibrated against exactly one confirmed card** (RX 7900 XTX / gfx1100, 0.03% accuracy against its published spec) — not a textbook constant, and not yet cross-validated against a second GDDR6 card with a different bus width/clock combination.

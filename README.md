@@ -174,7 +174,7 @@ standalone, without needing a full pipeline run.
 
 ## Seeds
 
-Four self-contained CUDA kernels in `seeds/`:
+Five self-contained CUDA kernels in `seeds/`:
 
 - `vectorAdd.cu` — memory-bandwidth-bound (e.g. ~5.3 TB/s HBM3 on MI300X — see the architecture-detection section below for how the actual peak used depends on the detected GPU)
 - `tiledMatmul.cu` — compute-bound, shared-memory tiling, targets FP32 TFLOPS peak
@@ -184,12 +184,20 @@ Four self-contained CUDA kernels in `seeds/`:
   Repair Loop** below), to give the Repair Loop a real, reproducible
   compile failure to fix. Not a hidden trick — the gap and why it's real
   are documented in the file's own header comment.
+- `multiFileDemo/` — a DIRECTORY, not a single `.cu` file: `main.cu`
+  calls a kernel + host wrapper defined in `helper.cu` and declared in
+  `helper.cuh`, exercising multi-file hipify + hipcc compile-and-link
+  (see **Tool Registry** below for the general mechanism). Not a
+  benchmark seed — no achieved-bandwidth/TFLOPS number is computed for
+  it, only real hipEvent kernel timing and a real correctness check.
 
-Each is fully self-contained: CUDA source + host driver + its own
-correctness self-check + timing, in one `.cu` file. (`repairDemo.cu` is
-a partial exception — a single no-op kernel with no bandwidth/TFLOPS
-self-check, since its entire purpose is the one intentional compile
-gap, not a performance measurement.)
+Each of the 4 single-file seeds is fully self-contained: CUDA source +
+host driver + its own correctness self-check + timing, in one `.cu`
+file — except `repairDemo.cu`, a partial exception (a single no-op
+kernel with no bandwidth/TFLOPS self-check, since its entire purpose is
+the one intentional compile gap, not a performance measurement).
+`multiFileDemo/` is the one seed that isn't single-file at all by
+design — see its own bullet above.
 
 ## How timing and bandwidth/TFLOPS are actually measured
 
@@ -333,13 +341,19 @@ curatable) knowledge base of known CUDA -> HIP porting gaps, retrieved by
 keyword overlap against a real compiler/hipify error message —
 `get_relevant_patterns(error_text)` scores each pattern by what fraction
 of **its own** identifying keywords appear in the error text (plain
-token overlap, not semantic reasoning). 4 curated patterns ship today,
+token overlap, not semantic reasoning). 7 curated patterns ship today,
 each with a real, cited source (HIPIFY's own unsupported-function table,
-or the CUDA/HIP header/doc trail directly, not invented).
+or the CUDA/HIP header/doc trail directly, not invented): the original 4
+(`cudaFuncGetName`, `cudaGraphConditionalHandleCreate`,
+`cudaDeviceFlushGPUDirectRDMAWrites`, `cudaCtxResetPersistingL2Cache`)
+plus 3 more added later with the same rigor
+(`cudaInitDevice`, `cudaEventElapsedTime_v2`, `cudaOccupancyMaxActiveClusters`
+— each independently confirmed absent from HIP's real current header by
+direct search, not just from the HIPIFY compatibility table alone).
 `scripts/test_memory.py` (11/11 passing) exercises retrieval,
 `add_pattern()`, and the full agent-context dump.
 
-Only one of the 4 has an `auto_fix` — a literal `old_text`/`new_text`
+Only one of the 7 has an `auto_fix` — a literal `old_text`/`new_text`
 pair a repair loop can apply *mechanically*, as opposed to `hip_fix`'s
 human-readable prose, which is never applied automatically:
 **`gap_cudaCtxResetPersistingL2Cache`**.
@@ -513,6 +527,24 @@ real run** (loads one of the 4 actual pod-captured job dirs via
 `/demo/replay` — works even when the backend itself is in MOCK mode,
 since it never runs anything new).
 
+## Architecture
+
+Same diagram as **JUDGING.md** — kept identical in both places on purpose;
+see the sections above (Tool Registry, Memory System & Repair Loop,
+FastAPI backend) for the full detail behind each box.
+
+```
+seed .cu(s) -> WorkspaceManager -> hipify (hipify-perl) -> hipcc -> run binary
+                                                              |
+                                                   [compile failed AND
+                                                    seed == repairDemo]
+                                                              v
+                                          Repair Loop <- Memory (porting_patterns.jsonl)
+                                                |             via Tool Registry
+                                                v
+                                      recompile -> validate -> amd-smi -> report + tar
+```
+
 ## Project layout
 
 ```
@@ -524,8 +556,8 @@ src/
   agents/tools.py        ToolRegistry — sandboxed action surface (8 tools)
   memory/loader.py       PortingMemory — the porting-pattern knowledge base
   main.py                FastAPI backend — thin wrapper around the above, nothing reimplemented
-seeds/                   Self-contained CUDA test kernels (vectorAdd, tiledMatmul, reduction, repairDemo)
-memory/porting_patterns.jsonl   The 4 curated porting patterns (JSONL)
+seeds/                   Self-contained CUDA test kernels (vectorAdd, tiledMatmul, reduction, repairDemo, multiFileDemo)
+memory/porting_patterns.jsonl   The 7 curated porting patterns (JSONL)
 frontend/                Next.js/React/TypeScript UI — see Frontend section above
 scripts/
   preflight.sh            Pod toolchain check — versions + rocminfo + a real HIP compile/run (run this first)

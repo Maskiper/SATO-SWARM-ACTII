@@ -138,26 +138,65 @@ class WorkspaceManager:
         final = Path(str(tar_path).replace(".tar.gz", "") + ".tar.gz")
         return final
 
-    def cleanup_old_jobs(self, max_age_hours: int = 24, max_jobs: int = 50) -> int:
-        """Light cleanup for the instance (keeps disk usage reasonable)."""
+    def cleanup_old_jobs(
+        self,
+        max_age_hours: int = 24,
+        max_jobs: Optional[int] = 50,
+        protected_job_ids: Optional[set[str]] = None,
+    ) -> tuple[int, int]:
+        """Delete job directories under this workspace's base_dir.
+
+        Two independent deletion criteria — a directory qualifying under
+        EITHER one gets deleted (deduplicated via a set, so a dir
+        matching both never gets double-counted or double-rmtree'd):
+          - age: mtime older than max_age_hours.
+          - count: max_jobs is not None and this dir falls outside the
+            max_jobs most-recently-modified directories. Pass
+            max_jobs=None to disable this criterion entirely — e.g.
+            src/main.py's /admin/cleanup endpoint always does this, since
+            its contract is explicitly age-only; count-based truncation
+            firing as a surprise side effect of an age-scoped request
+            would be its own kind of bug.
+
+        protected_job_ids: directory names (== job_id, see
+        get_workspace()) that are NEVER deleted, unconditionally,
+        regardless of how old or how far outside max_jobs they are. This
+        is how src/main.py's /admin/cleanup endpoint keeps the 4 real
+        captured job directories /demo/replay depends on
+        (REPLAY_JOB_IDS' values) safe from an age-based sweep — those
+        real captures are, as of this writing, already more than 24
+        hours old and would otherwise be deleted by the very first call
+        with default settings.
+
+        Returns (cleaned_count, skipped_protected_count) — the second
+        number is how many directories in protected_job_ids actually
+        exist here right now (regardless of whether they individually
+        would have matched a deletion criterion), so a caller gets a
+        positive "yes, all N are still here" confirmation rather than
+        only inferring it from the absence of an error.
+        """
         import time
         now = time.time()
-        count = 0
+        protected = protected_job_ids or set()
 
         job_dirs = sorted(self.base.glob("job_*"), key=lambda p: p.stat().st_mtime, reverse=True)
 
-        for d in job_dirs[max_jobs:]:
+        to_delete: set[Path] = set()
+        if max_jobs is not None:
+            for d in job_dirs[max_jobs:]:
+                if d.name not in protected:
+                    to_delete.add(d)
+        for d in job_dirs:
+            if d.name not in protected and now - d.stat().st_mtime > max_age_hours * 3600:
+                to_delete.add(d)
+
+        cleaned = 0
+        for d in to_delete:
             try:
                 shutil.rmtree(d)
-                count += 1
+                cleaned += 1
             except Exception:
                 pass
 
-        for d in job_dirs:
-            if now - d.stat().st_mtime > max_age_hours * 3600:
-                try:
-                    shutil.rmtree(d)
-                    count += 1
-                except Exception:
-                    pass
-        return count
+        skipped_protected = sum(1 for d in job_dirs if d.name in protected)
+        return cleaned, skipped_protected
